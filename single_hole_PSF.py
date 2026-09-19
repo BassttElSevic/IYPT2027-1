@@ -271,8 +271,10 @@ class SimulationConfig:
     psf_log_dynamic_range: float = 3.0
     heatmap_logmar_min: float = -0.5
     heatmap_logmar_max: float = 1.5
-    main_figure_size_inches: tuple[float, float] = (18.0, 11.0)
-    comparison_figure_size_inches: tuple[float, float] = (16.0, 11.0)
+    main_figure_size_inches: tuple[float, float] = (24.0, 17.0)
+    comparison_figure_size_inches: tuple[float, float] = (26.0, 18.0)
+    conclusion_font_size: float = 11.0
+    validation_table_font_size: float = 9.0
     comparison_profile_half_width_arcmin: float = 16.0
     comparison_profile_dynamic_range: float = 4.0
     wavelength_colormap_name: str = "turbo"
@@ -734,6 +736,34 @@ def minimum_logmar(
     )
 
 
+def wavelength_conclusion_lines(
+    rows: list[dict[str, Any]],
+    wavelength_nm: float,
+    myopia_values: tuple[float, ...],
+    config: SimulationConfig,
+) -> list[str]:
+    conclusion_lines: list[str] = []
+    for myopia_d in myopia_values:
+        optimum_mm = simulated_optimum_diameter_mm(
+            rows, wavelength_nm, myopia_d
+        )
+        best_log_mar = minimum_logmar(rows, wavelength_nm, myopia_d)
+        conclusion_lines.append(
+            f"在 {wavelength_nm:g} nm、近视 {myopia_d:g} D"
+            f"（等效针孔-视网膜距离 {config.focal_length_mm:g} mm）时，"
+            f"最合理孔径 d_opt = {optimum_mm:.4f} mm，"
+            f"对应 logMAR = {best_log_mar:.3f}。"
+        )
+        conclusion_lines.append(
+            f"At {wavelength_nm:g} nm and {myopia_d:g} D myopia "
+            f"(equivalent pinhole-retina distance "
+            f"{config.focal_length_mm:g} mm), the optimal pinhole "
+            f"diameter is {optimum_mm:.4f} mm, giving "
+            f"logMAR = {best_log_mar:.3f}."
+        )
+    return conclusion_lines
+
+
 def rows_for_wavelength(
     rows: list[dict[str, Any]], wavelength_nm: float
 ) -> list[dict[str, Any]]:
@@ -969,7 +999,7 @@ def plot_logmar_heatmap(
     axis.set_ylabel("近视度数 / Myopia M (D)")
     axis.set_title(f"logMAR 热图 / logMAR map ({wavelength_nm:g} nm)")
     axis.set_xscale("log")
-    axis.legend(loc="upper left")
+    axis.legend(loc="lower right", fontsize=9, framealpha=0.92)
     colorbar = axis.figure.colorbar(image, ax=axis, pad=0.02)
     colorbar.set_label("logMAR（D50 路径 / D50 route）")
 
@@ -981,6 +1011,7 @@ def plot_optimal_diameter_curve(
     myopia_values: tuple[float, ...],
     config: SimulationConfig,
     show_theory_legend: bool = True,
+    legend_columns: int = 2,
 ) -> None:
     positive_myopia = [value for value in myopia_values if value > 0.0]
     multiple_wavelengths = len(wavelengths_nm) > 1
@@ -1025,7 +1056,11 @@ def plot_optimal_diameter_curve(
     axis.set_title("最优孔径 / Optimal diameter d_opt(M)")
     axis.set_yscale("log")
     axis.grid(alpha=0.25)
-    axis.legend(fontsize=6 if multiple_wavelengths else 8, ncol=2)
+    axis.legend(
+        fontsize=7 if multiple_wavelengths else 9,
+        ncol=legend_columns,
+        loc="best",
+    )
 
 
 def draw_psf_mosaic(
@@ -1075,7 +1110,9 @@ def draw_psf_mosaic(
 
 
 def plot_validation_table(
-    axis: plt.Axes, validation_rows: list[dict[str, Any]]
+    axis: plt.Axes,
+    validation_rows: list[dict[str, Any]],
+    config: SimulationConfig,
 ) -> None:
     axis.axis("off")
     headers = [
@@ -1111,8 +1148,8 @@ def plot_validation_table(
         cellLoc="center",
     )
     table.auto_set_font_size(False)
-    table.set_fontsize(7)
-    table.scale(1.0, 1.25)
+    table.set_fontsize(config.validation_table_font_size)
+    table.scale(1.0, 1.35)
     axis.set_title("数值锚点 / Numerical anchors", pad=14)
 
 
@@ -1130,15 +1167,21 @@ def save_wavelength_figure(
 ) -> None:
     figure = plt.figure(figsize=config.main_figure_size_inches, dpi=config.figure_dpi)
     grid = figure.add_gridspec(
+        3,
         2,
-        2,
-        height_ratios=(1.0, 0.85),
-        hspace=0.28,
-        wspace=0.20,
+        height_ratios=(1.10, 0.92, 0.70),
+        hspace=0.36,
+        wspace=0.18,
     )
     heatmap_axis = figure.add_subplot(grid[0, 0])
-    curve_axis = figure.add_subplot(grid[0, 1])
+    right_column = grid[0, 1].subgridspec(
+        2, 1, height_ratios=(1.0, 0.82), hspace=0.22
+    )
+    curve_axis = figure.add_subplot(right_column[0, 0])
+    validation_axis = figure.add_subplot(right_column[1, 0])
     mosaic_spec = grid[1, :]
+    conclusion_axis = figure.add_subplot(grid[2, :])
+    conclusion_axis.axis("off")
 
     plot_logmar_heatmap(
         heatmap_axis,
@@ -1170,12 +1213,32 @@ def save_wavelength_figure(
         if row["wavelength_nm"] == wavelength_nm
     ]
     plot_validation_table(
-        curve_axis.inset_axes([0.30, 0.02, 0.68, 0.38]),
+        validation_axis,
         wavelength_validation,
+        config,
+    )
+    conclusion_lines = wavelength_conclusion_lines(
+        rows,
+        wavelength_nm,
+        config.diameter_refinement_myopia_d,
+        config,
+    )
+    conclusion_axis.set_title(
+        "结论 / Conclusions", fontsize=14, pad=12
+    )
+    conclusion_axis.text(
+        0.01,
+        0.98,
+        "\n".join(conclusion_lines),
+        transform=conclusion_axis.transAxes,
+        ha="left",
+        va="top",
+        fontsize=config.conclusion_font_size,
+        linespacing=1.45,
     )
     figure.suptitle(
         f"单孔 PSF 扫描 / Single-hole PSF scan: {wavelength_nm:g} nm",
-        fontsize=15,
+        fontsize=17,
     )
     figure.savefig(output_path, dpi=config.figure_dpi, bbox_inches="tight")
     plt.close(figure)
@@ -1310,11 +1373,20 @@ def save_wavelength_comparison_figure(
     figure = plt.figure(
         figsize=config.comparison_figure_size_inches, dpi=config.figure_dpi
     )
-    grid = figure.add_gridspec(2, 2, hspace=0.32, wspace=0.24)
-    optimum_axis = figure.add_subplot(grid[0, 0])
-    acuity_axis = figure.add_subplot(grid[0, 1])
-    shift_axis = figure.add_subplot(grid[1, 0])
-    profile_axis = figure.add_subplot(grid[1, 1])
+    grid = figure.add_gridspec(
+        4,
+        2,
+        height_ratios=(1.05, 0.80, 1.05, 0.78),
+        hspace=0.34,
+        wspace=0.22,
+    )
+    optimum_axis = figure.add_subplot(grid[0, :])
+    acuity_axis = figure.add_subplot(grid[1, 0])
+    shift_axis = figure.add_subplot(grid[1, 1])
+    profile_axis = figure.add_subplot(grid[2, :])
+    conclusion_spec = grid[3, :].subgridspec(1, 2, wspace=0.08)
+    conclusion_left_axis = figure.add_subplot(conclusion_spec[0, 0])
+    conclusion_right_axis = figure.add_subplot(conclusion_spec[0, 1])
 
     plot_optimal_diameter_curve(
         optimum_axis,
@@ -1323,10 +1395,11 @@ def save_wavelength_comparison_figure(
         myopia_values,
         config,
         show_theory_legend=False,
+        legend_columns=4,
     )
     optimum_axis.text(
-        0.98,
-        0.02,
+        0.99,
+        0.03,
         "同色虚线 / Dotted curves: theory",
         transform=optimum_axis.transAxes,
         ha="right",
@@ -1362,12 +1435,50 @@ def save_wavelength_comparison_figure(
         f"各波长最优 PSF 剖面 / PSF profiles at M = {config.psf_snapshot_myopia_d:g} D"
     )
     profile_axis.grid(alpha=0.25)
-    profile_axis.legend(fontsize=6, ncol=2)
+    profile_axis.legend(fontsize=8, ncol=4)
+
+    comparison_conclusions: list[str] = []
+    for wavelength_nm in wavelengths_nm:
+        comparison_conclusions.append(
+            "\n".join(
+                wavelength_conclusion_lines(
+                    rows,
+                    wavelength_nm,
+                    (config.psf_snapshot_myopia_d,),
+                    config,
+                )
+            )
+        )
+    split_index = math.ceil(len(comparison_conclusions) / 2)
+    conclusion_columns = (
+        comparison_conclusions[:split_index],
+        comparison_conclusions[split_index:],
+    )
+    for axis, conclusion_column in zip(
+        (conclusion_left_axis, conclusion_right_axis),
+        conclusion_columns,
+    ):
+        axis.axis("off")
+        axis.text(
+            0.0,
+            1.0,
+            "\n\n".join(conclusion_column),
+            transform=axis.transAxes,
+            ha="left",
+            va="top",
+            fontsize=config.conclusion_font_size,
+            linespacing=1.35,
+        )
+    conclusion_left_axis.set_title(
+        "代表近视度数下的结论 / Conclusions at representative myopia",
+        fontsize=13,
+        pad=10,
+    )
 
     figure.suptitle(
         f"可见光 {len(wavelengths_nm)} 波长单孔 PSF 对比 / "
         "Single-hole PSF comparison across visible wavelengths",
-        fontsize=15,
+        fontsize=17,
     )
     figure.savefig(output_path, dpi=config.figure_dpi, bbox_inches="tight")
     plt.close(figure)

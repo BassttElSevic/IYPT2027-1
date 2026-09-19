@@ -57,13 +57,15 @@
   "heatmap_logmar_min": -0.5,
   "heatmap_logmar_max": 1.5,
   "main_figure_size_inches": [
-    18.0,
-    11.0
+    24.0,
+    17.0
   ],
   "comparison_figure_size_inches": [
-    16.0,
-    11.0
+    26.0,
+    18.0
   ],
+  "conclusion_font_size": 11.0,
+  "validation_table_font_size": 9.0,
   "comparison_profile_half_width_arcmin": 16.0,
   "comparison_profile_dynamic_range": 4.0,
   "wavelength_colormap_name": "turbo",
