@@ -271,10 +271,27 @@ class SimulationConfig:
     psf_log_dynamic_range: float = 3.0
     heatmap_logmar_min: float = -0.5
     heatmap_logmar_max: float = 1.5
-    main_figure_size_inches: tuple[float, float] = (24.0, 17.0)
+    main_figure_size_inches: tuple[float, float] = (28.0, 20.0)
     comparison_figure_size_inches: tuple[float, float] = (26.0, 18.0)
     conclusion_font_size: float = 11.0
-    validation_table_font_size: float = 9.0
+    validation_table_font_size: float = 10.5
+    validation_table_scale_x: float = 1.0
+    validation_table_scale_y: float = 1.65
+    validation_table_title_pad: float = 18.0
+    validation_table_column_widths: tuple[float, ...] = (
+        0.30,
+        0.10,
+        0.09,
+        0.17,
+        0.16,
+        0.18,
+    )
+    main_grid_height_ratios: tuple[float, ...] = (1.18, 1.00, 0.62)
+    main_grid_hspace: float = 0.52
+    main_grid_wspace: float = 0.22
+    right_column_height_ratios: tuple[float, ...] = (0.88, 1.18)
+    right_column_hspace: float = 0.48
+    psf_mosaic_wspace: float = 0.16
     comparison_profile_half_width_arcmin: float = 16.0
     comparison_profile_dynamic_range: float = 4.0
     wavelength_colormap_name: str = "turbo"
@@ -1073,10 +1090,12 @@ def draw_psf_mosaic(
     config: SimulationConfig,
 ) -> None:
     mosaic = subplot_spec.subgridspec(
-        1, len(representative_diameters_mm), wspace=0.05
+        1, len(representative_diameters_mm), wspace=config.psf_mosaic_wspace
     )
+    mosaic_axes: list[plt.Axes] = []
     for index, diameter_mm in enumerate(representative_diameters_mm):
         axis = figure.add_subplot(mosaic[0, index])
+        mosaic_axes.append(axis)
         key = (wavelength_nm, diameter_mm)
         snapshot = snapshots[key]
         sampling = samplings[key]
@@ -1107,6 +1126,21 @@ def draw_psf_mosaic(
         axis.set_aspect("equal")
         colorbar = axis.figure.colorbar(image, ax=axis, fraction=0.046, pad=0.03)
         colorbar.ax.tick_params(labelsize=7)
+
+    left = mosaic_axes[0].get_position().x0
+    right = mosaic_axes[-1].get_position().x1
+    top = max(axis.get_position().y1 for axis in mosaic_axes)
+    figure.text(
+        (left + right) / 2.0,
+        top + 0.025,
+        f"M = {config.psf_snapshot_myopia_d:g} D 下不同针孔直径的视网膜 PSF"
+        "（角坐标，强度取对数） / "
+        f"Retinal PSF at M = {config.psf_snapshot_myopia_d:g} D for different "
+        "pinhole diameters (angular coordinates, logarithmic intensity)",
+        ha="center",
+        va="bottom",
+        fontsize=10.0,
+    )
 
 
 def plot_validation_table(
@@ -1149,8 +1183,17 @@ def plot_validation_table(
     )
     table.auto_set_font_size(False)
     table.set_fontsize(config.validation_table_font_size)
-    table.scale(1.0, 1.35)
-    axis.set_title("数值锚点 / Numerical anchors", pad=14)
+    table.scale(
+        config.validation_table_scale_x,
+        config.validation_table_scale_y,
+    )
+    for (_, column_index), cell in table.get_celld().items():
+        if column_index < len(config.validation_table_column_widths):
+            cell.set_width(config.validation_table_column_widths[column_index])
+    axis.set_title(
+        "数值锚点 / Numerical anchors",
+        pad=config.validation_table_title_pad,
+    )
 
 
 def save_wavelength_figure(
@@ -1169,13 +1212,16 @@ def save_wavelength_figure(
     grid = figure.add_gridspec(
         3,
         2,
-        height_ratios=(1.10, 0.92, 0.70),
-        hspace=0.36,
-        wspace=0.18,
+        height_ratios=config.main_grid_height_ratios,
+        hspace=config.main_grid_hspace,
+        wspace=config.main_grid_wspace,
     )
     heatmap_axis = figure.add_subplot(grid[0, 0])
     right_column = grid[0, 1].subgridspec(
-        2, 1, height_ratios=(1.0, 0.82), hspace=0.22
+        2,
+        1,
+        height_ratios=config.right_column_height_ratios,
+        hspace=config.right_column_hspace,
     )
     curve_axis = figure.add_subplot(right_column[0, 0])
     validation_axis = figure.add_subplot(right_column[1, 0])

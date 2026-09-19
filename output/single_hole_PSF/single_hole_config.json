@@ -57,15 +57,39 @@
   "heatmap_logmar_min": -0.5,
   "heatmap_logmar_max": 1.5,
   "main_figure_size_inches": [
-    24.0,
-    17.0
+    28.0,
+    20.0
   ],
   "comparison_figure_size_inches": [
     26.0,
     18.0
   ],
   "conclusion_font_size": 11.0,
-  "validation_table_font_size": 9.0,
+  "validation_table_font_size": 10.5,
+  "validation_table_scale_x": 1.0,
+  "validation_table_scale_y": 1.65,
+  "validation_table_title_pad": 18.0,
+  "validation_table_column_widths": [
+    0.3,
+    0.1,
+    0.09,
+    0.17,
+    0.16,
+    0.18
+  ],
+  "main_grid_height_ratios": [
+    1.18,
+    1.0,
+    0.62
+  ],
+  "main_grid_hspace": 0.52,
+  "main_grid_wspace": 0.22,
+  "right_column_height_ratios": [
+    0.88,
+    1.18
+  ],
+  "right_column_hspace": 0.48,
+  "psf_mosaic_wspace": 0.16,
   "comparison_profile_half_width_arcmin": 16.0,
   "comparison_profile_dynamic_range": 4.0,
   "wavelength_colormap_name": "turbo",
