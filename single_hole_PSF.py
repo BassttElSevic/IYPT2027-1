@@ -162,3 +162,16 @@ $$2.44\lambda = 2.44 \times 550\,\mathrm{nm} = 1.342\,\mu\mathrm{m} = 1.342\time
 
 # 所有的物理量，哪怕是网格大小，都不准写成硬编码！必须要规范！这里所有的量，都要写成变量的形式！任何量都不准硬编码
 # 生成的图放在output这份文件夹里，图的命名规则是：PSF_550nm.png、PSF_450nm.png、PSF_650nm.png
+
+import os
+import warnings
+warnings.filterwarnings("ignore", message="CUDA path could not be detected")
+# 强制指定 CuPy 的缓存和工作目录，绕开系统 TEMP 的干扰！
+os.environ["CUPY_CACHE_DIR"] = r"C:\Temp\cupy_cache"
+os.environ["TEMP"] = r"C:\Temp"
+os.environ["TMP"] = r"C:\Temp"
+
+# 确保目录存在
+os.makedirs(r"C:\Temp\cupy_cache", exist_ok=True)
+
+# 用matplotlib画图

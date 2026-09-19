@@ -16,8 +16,4 @@ cupy-cuda12x>=13.4
 diffractio           # 扩展源/多波长交叉验证 (注意: 现版 GPLv3, 结果仅作对照)
 diffractsim>=2.2.7   # 展示/出图, PolychromaticField 内置 CIE/D65, 支持 set_backend("CUDA")
 
-# ---- 可选 ----
-# lightpipes        # BSD-3, 菲涅尔传播交叉验证备选
-# poppy             # 备选 (Fresnel 模式不支持斜入射, 仅单孔参考)
-# pyfftw            # CPU 端 FFT 加速 (~5x), 无 GPU 时装
-# colour-science    # CIE V(λ)/色度计算 (diffractsim 已内置, 独立计算时装)
+
