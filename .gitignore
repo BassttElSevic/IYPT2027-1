@@ -216,3 +216,11 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# what hell
+
+.idea/
+.venv/
+
+.vscode/
+*.iml
