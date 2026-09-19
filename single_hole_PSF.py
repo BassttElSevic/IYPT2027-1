@@ -162,6 +162,7 @@ $$2.44\lambda = 2.44 \times 550\,\mathrm{nm} = 1.342\,\mu\mathrm{m} = 1.342\time
 
 # 所有的物理量，哪怕是网格大小，都不准写成硬编码！必须要规范！这里所有的量，都要写成变量的形式！任何量都不准硬编码
 # 生成的图放在output这份文件夹里，图的命名规则是：PSF_550nm.png、PSF_450nm.png、PSF_650nm.png
+# 更新：可见光波长数量由单一配置项控制；每个波长独立出图和独立保存五值验证；另增加跨波长对比图。
 
 import os
 import warnings
@@ -189,6 +190,7 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib import font_manager
 from matplotlib.colors import LogNorm
 
 
@@ -197,6 +199,17 @@ METRES_PER_MILLIMETRE = 1.0e-3
 METRES_PER_NANOMETRE = 1.0e-9
 ARCMINUTES_PER_RADIAN = 180.0 * 60.0 / math.pi
 ARCMINUTES_PER_DEGREE = 60.0
+
+
+def configure_bilingual_plot_font() -> None:
+    preferred_fonts = ("Microsoft YaHei", "SimHei", "Noto Sans CJK SC")
+    installed_fonts = {font.name for font in font_manager.fontManager.ttflist}
+    selected_font = next(
+        (font for font in preferred_fonts if font in installed_fonts),
+        "DejaVu Sans",
+    )
+    plt.rcParams["font.sans-serif"] = [selected_font, "DejaVu Sans"]
+    plt.rcParams["axes.unicode_minus"] = False
 
 
 @dataclass(frozen=True)
@@ -209,8 +222,12 @@ class SimulationConfig:
     complex_dtype: Any = cp.complex64
     accumulator_dtype: Any = cp.float64
 
-    # 波长与眼模型
-    wavelengths_nm: tuple[float, ...] = (450.0, 550.0, 650.0)
+    # 波长与眼模型：可见光范围与采样数量均由配置控制。
+    visible_min_nm: float = 400.0
+    visible_max_nm: float = 700.0
+    # 这是波长数量的唯一入口，循环、目录和验证表都不写固定数量。
+    wavelength_sample_count: int = 7
+    wavelength_rounding_decimals: int = 6
     primary_wavelength_nm: float = 550.0
     focal_length_mm: float = 25.0
     airy_first_zero_radius_coefficient: float = 1.22
@@ -256,16 +273,48 @@ class SimulationConfig:
     heatmap_logmar_max: float = 1.5
     main_figure_size_inches: tuple[float, float] = (18.0, 11.0)
     comparison_figure_size_inches: tuple[float, float] = (16.0, 11.0)
+    comparison_profile_half_width_arcmin: float = 16.0
+    comparison_profile_dynamic_range: float = 4.0
+    wavelength_colormap_name: str = "turbo"
     figure_dpi: int = 300
 
     # 输出命名与目录
-    output_directory_name: str = "output"
+    output_root_directory_name: str = "output"
+    simulation_directory_name: str = "single_hole_PSF"
+    wavelength_directory_name_template: str = "PSF_{wavelength_nm:g}nm"
+    comparison_directory_name: str = "wavelength_comparison"
     psf_figure_filename_template: str = "PSF_{wavelength_nm:g}nm.png"
+    comparison_figure_filename: str = "wavelength_comparison.png"
     metrics_filename: str = "single_hole_metrics.csv"
     validation_filename: str = "single_hole_validation.csv"
+    aggregate_metrics_filename: str = "all_wavelength_metrics.csv"
+    aggregate_validation_filename: str = "all_wavelength_validation.csv"
     config_filename: str = "single_hole_config.json"
 
+    @property
+    def wavelengths_nm(self) -> tuple[float, ...]:
+        if self.wavelength_sample_count < 1:
+            raise ValueError("wavelength_sample_count must be positive")
+        sampled = cp.linspace(
+            self.visible_min_nm,
+            self.visible_max_nm,
+            self.wavelength_sample_count,
+            dtype=cp.float64,
+        )
+        return tuple(
+            round(float(value), self.wavelength_rounding_decimals)
+            for value in sampled.get()
+        )
+
     def __post_init__(self) -> None:
+        if self.visible_min_nm <= 0.0:
+            raise ValueError("visible_min_nm must be positive")
+        if self.visible_max_nm <= self.visible_min_nm:
+            raise ValueError("visible_max_nm must exceed visible_min_nm")
+        if self.wavelength_sample_count < 1:
+            raise ValueError("wavelength_sample_count must be positive")
+        if self.wavelength_rounding_decimals < 0:
+            raise ValueError("wavelength_rounding_decimals cannot be negative")
         if self.diameter_min_mm <= 0.0:
             raise ValueError("diameter_min_mm must be positive")
         if self.diameter_max_mm <= self.diameter_min_mm:
@@ -276,14 +325,12 @@ class SimulationConfig:
             raise ValueError("grid_size must contain the sampled aperture")
         if self.grid_size % 2 != 0:
             raise ValueError("grid_size must be even for a centred FFT")
-        if self.grid_size // 2 != self.grid_size / 2:
-            raise ValueError("grid centre is invalid")
         if not 0.0 < self.d50_energy_fraction < 1.0:
             raise ValueError("d50_energy_fraction must lie between zero and one")
         if not 0.0 < self.mtf50_threshold < 1.0:
             raise ValueError("mtf50_threshold must lie between zero and one")
-        if self.primary_wavelength_nm not in self.wavelengths_nm:
-            raise ValueError("primary_wavelength_nm must be included in wavelengths_nm")
+        if not self.visible_min_nm <= self.primary_wavelength_nm <= self.visible_max_nm:
+            raise ValueError("primary_wavelength_nm must lie in the visible range")
 
 
 @dataclass(frozen=True)
@@ -638,6 +685,55 @@ def nearest_diameter(
     return min(diameter_grid, key=lambda value: abs(value - target_diameter_mm))
 
 
+def nearest_wavelength(
+    config: SimulationConfig, target_wavelength_nm: float
+) -> float:
+    return min(
+        config.wavelengths_nm,
+        key=lambda value: abs(value - target_wavelength_nm),
+    )
+
+
+def wavelength_colour(
+    config: SimulationConfig, wavelength_nm: float
+) -> tuple[float, float, float, float]:
+    visible_span = config.visible_max_nm - config.visible_min_nm
+    normalized = (wavelength_nm - config.visible_min_nm) / visible_span
+    normalized = min(max(normalized, 0.0), 1.0)
+    return plt.get_cmap(config.wavelength_colormap_name)(normalized)
+
+
+def simulated_optimum_diameter_mm(
+    rows: list[dict[str, Any]],
+    wavelength_nm: float,
+    myopia_d: float,
+) -> float:
+    candidates = sorted(
+        (
+            row
+            for row in rows
+            if row["wavelength_nm"] == wavelength_nm
+            and row["myopia_d"] == myopia_d
+        ),
+        key=lambda row: row["diameter_mm"],
+    )
+    return interpolated_minimum_diameter(
+        [row["diameter_mm"] for row in candidates],
+        [row["log_mar"] for row in candidates],
+    )
+
+
+def minimum_logmar(
+    rows: list[dict[str, Any]], wavelength_nm: float, myopia_d: float
+) -> float:
+    return min(
+        row["log_mar"]
+        for row in rows
+        if row["wavelength_nm"] == wavelength_nm
+        and row["myopia_d"] == myopia_d
+    )
+
+
 def rows_for_wavelength(
     rows: list[dict[str, Any]], wavelength_nm: float
 ) -> list[dict[str, Any]]:
@@ -734,15 +830,18 @@ def build_integrity_validation_rows(
     radial_bin_index: cp.ndarray,
     radial_bin_count: int,
 ) -> list[dict[str, Any]]:
+    reference_wavelength_nm = nearest_wavelength(
+        config, config.primary_wavelength_nm
+    )
     maximum_energy_error = max(
         abs(row["psf_total"] - 1.0) * 100.0 for row in rows
     )
     energy_row = {
         "validation": "PSF energy normalization",
-        "wavelength_nm": config.primary_wavelength_nm,
+        "wavelength_nm": reference_wavelength_nm,
         "myopia_d": config.symmetry_myopia_d,
         "diameter_mm": nearest_diameter(
-            build_diameter_grid(config, config.primary_wavelength_nm),
+            build_diameter_grid(config, reference_wavelength_nm),
             config.validation_diameter_mm,
         ),
         "simulation_value": maximum_energy_error,
@@ -753,17 +852,17 @@ def build_integrity_validation_rows(
     }
 
     symmetry_diameter_mm = nearest_diameter(
-        build_diameter_grid(config, config.primary_wavelength_nm),
+        build_diameter_grid(config, reference_wavelength_nm),
         config.validation_diameter_mm,
     )
     sampling = build_sampling(
-        config, config.primary_wavelength_nm, symmetry_diameter_mm
+        config, reference_wavelength_nm, symmetry_diameter_mm
     )
     positive_psf = compute_psf(
         config,
         aperture,
         normalized_radius_squared,
-        config.primary_wavelength_nm,
+        reference_wavelength_nm,
         symmetry_diameter_mm,
         config.symmetry_myopia_d,
     )
@@ -771,7 +870,7 @@ def build_integrity_validation_rows(
         config,
         aperture,
         normalized_radius_squared,
-        config.primary_wavelength_nm,
+        reference_wavelength_nm,
         symmetry_diameter_mm,
         -config.symmetry_myopia_d,
     )
@@ -792,7 +891,7 @@ def build_integrity_validation_rows(
     symmetry_error = (negative_d50 - positive_d50) / positive_d50 * 100.0
     symmetry_row = {
         "validation": "defocus sign symmetry",
-        "wavelength_nm": config.primary_wavelength_nm,
+        "wavelength_nm": reference_wavelength_nm,
         "myopia_d": config.symmetry_myopia_d,
         "diameter_mm": symmetry_diameter_mm,
         "simulation_value": positive_d50,
@@ -864,15 +963,15 @@ def plot_logmar_heatmap(
         color="white",
         linestyle="--",
         linewidth=1.8,
-        label="theory d*",
+        label="理论 d* / Theory d*",
     )
-    axis.set_xlabel("Pinhole diameter d (mm)")
-    axis.set_ylabel("Myopia M (D)")
-    axis.set_title(f"logMAR map ({wavelength_nm:g} nm)")
+    axis.set_xlabel("针孔直径 / Pinhole diameter d (mm)")
+    axis.set_ylabel("近视度数 / Myopia M (D)")
+    axis.set_title(f"logMAR 热图 / logMAR map ({wavelength_nm:g} nm)")
     axis.set_xscale("log")
     axis.legend(loc="upper left")
     colorbar = axis.figure.colorbar(image, ax=axis, pad=0.02)
-    colorbar.set_label("logMAR (D50 route)")
+    colorbar.set_label("logMAR（D50 路径 / D50 route）")
 
 
 def plot_optimal_diameter_curve(
@@ -881,25 +980,18 @@ def plot_optimal_diameter_curve(
     wavelengths_nm: tuple[float, ...],
     myopia_values: tuple[float, ...],
     config: SimulationConfig,
+    show_theory_legend: bool = True,
 ) -> None:
     positive_myopia = [value for value in myopia_values if value > 0.0]
+    multiple_wavelengths = len(wavelengths_nm) > 1
     for wavelength_nm in wavelengths_nm:
         wavelength_rows = rows_for_wavelength(rows, wavelength_nm)
         simulated = []
         theory = []
         for myopia_d in positive_myopia:
-            candidates = sorted(
-                (
-                    row
-                    for row in wavelength_rows
-                    if row["myopia_d"] == myopia_d
-                ),
-                key=lambda row: row["diameter_mm"],
-            )
             simulated.append(
-                interpolated_minimum_diameter(
-                    [row["diameter_mm"] for row in candidates],
-                    [row["log_mar"] for row in candidates],
+                simulated_optimum_diameter_mm(
+                    wavelength_rows, wavelength_nm, myopia_d
                 )
             )
             theory.append(
@@ -907,26 +999,33 @@ def plot_optimal_diameter_curve(
                     config, wavelength_nm, myopia_d
                 )
             )
+        colour = wavelength_colour(config, wavelength_nm)
         axis.plot(
             positive_myopia,
             simulated,
             marker="o",
+            color=colour,
             linewidth=1.8,
-            label=f"{wavelength_nm:g} nm simulation",
+            label=f"{wavelength_nm:g} nm 仿真 / Simulation",
         )
         axis.plot(
             positive_myopia,
             theory,
+            color=colour,
             linestyle="--",
             linewidth=1.4,
-            label=f"{wavelength_nm:g} nm theory",
+            label=(
+                f"{wavelength_nm:g} nm 理论 / Theory"
+                if show_theory_legend
+                else "_nolegend_"
+            ),
         )
-    axis.set_xlabel("Myopia M (D)")
-    axis.set_ylabel("Optimal pinhole diameter (mm)")
-    axis.set_title("d_opt(M): simulated optimum vs diffraction-defocus theory")
+    axis.set_xlabel("近视度数 / Myopia M (D)")
+    axis.set_ylabel("最优孔径 / Optimal diameter (mm)")
+    axis.set_title("最优孔径 / Optimal diameter d_opt(M)")
     axis.set_yscale("log")
     axis.grid(alpha=0.25)
-    axis.legend(fontsize=8)
+    axis.legend(fontsize=6 if multiple_wavelengths else 8, ncol=2)
 
 
 def draw_psf_mosaic(
@@ -965,9 +1064,9 @@ def draw_psf_mosaic(
             norm=LogNorm(vmin=dynamic_floor, vmax=peak),
         )
         axis.set_title(f"d = {diameter_mm:.3f} mm", fontsize=9)
-        axis.set_xlabel("arcmin")
+        axis.set_xlabel("角分 / arcmin")
         if index == 0:
-            axis.set_ylabel("arcmin")
+            axis.set_ylabel("角分 / arcmin")
         else:
             axis.set_yticklabels([])
         axis.set_aspect("equal")
@@ -979,12 +1078,25 @@ def plot_validation_table(
     axis: plt.Axes, validation_rows: list[dict[str, Any]]
 ) -> None:
     axis.axis("off")
-    headers = ["check", "lambda", "M", "d_sim", "theory", "error"]
+    headers = [
+        "检查 / Check",
+        "波长 / λ",
+        "近视 / M",
+        "仿真 / Simulation",
+        "理论 / Theory",
+        "误差 / Error",
+    ]
     table_rows = []
     for row in validation_rows:
+        validation_label = {
+            "Airy first dark ring": "Airy 暗环 / Airy ring",
+            "optimal diameter": "最优孔径 / Optimal diameter",
+            "PSF energy normalization": "能量归一化 / Energy",
+            "defocus sign symmetry": "离焦对称 / Defocus symmetry",
+        }.get(row["validation"], row["validation"])
         table_rows.append(
             [
-                row["validation"],
+                validation_label,
                 f"{row['wavelength_nm']:g} nm",
                 f"{row['myopia_d']:g} D",
                 f"{row['simulation_value']:.4g}",
@@ -1001,13 +1113,14 @@ def plot_validation_table(
     table.auto_set_font_size(False)
     table.set_fontsize(7)
     table.scale(1.0, 1.25)
-    axis.set_title("Numerical anchors", pad=14)
+    axis.set_title("数值锚点 / Numerical anchors", pad=14)
 
 
-def save_primary_figure(
+def save_wavelength_figure(
     output_path: Path,
     rows: list[dict[str, Any]],
     validation_rows: list[dict[str, Any]],
+    wavelength_nm: float,
     diameter_grid: tuple[float, ...],
     myopia_values: tuple[float, ...],
     snapshots: dict[tuple[float, float], cp.ndarray],
@@ -1030,7 +1143,7 @@ def save_primary_figure(
     plot_logmar_heatmap(
         heatmap_axis,
         rows,
-        config.primary_wavelength_nm,
+        wavelength_nm,
         diameter_grid,
         myopia_values,
         config,
@@ -1038,7 +1151,7 @@ def save_primary_figure(
     plot_optimal_diameter_curve(
         curve_axis,
         rows,
-        (config.primary_wavelength_nm,),
+        (wavelength_nm,),
         myopia_values,
         config,
     )
@@ -1046,137 +1159,217 @@ def save_primary_figure(
         figure,
         mosaic_spec,
         snapshots,
-        config.primary_wavelength_nm,
+        wavelength_nm,
         representative_diameters_mm,
         samplings,
         config,
     )
-    primary_validation = [
+    wavelength_validation = [
         row
         for row in validation_rows
-        if row["wavelength_nm"] == config.primary_wavelength_nm
+        if row["wavelength_nm"] == wavelength_nm
     ]
-    plot_validation_table(curve_axis.inset_axes([0.30, 0.02, 0.68, 0.38]), primary_validation)
+    plot_validation_table(
+        curve_axis.inset_axes([0.30, 0.02, 0.68, 0.38]),
+        wavelength_validation,
+    )
     figure.suptitle(
-        f"Single-hole PSF scan: primary wavelength {config.primary_wavelength_nm:g} nm",
+        f"单孔 PSF 扫描 / Single-hole PSF scan: {wavelength_nm:g} nm",
         fontsize=15,
     )
     figure.savefig(output_path, dpi=config.figure_dpi, bbox_inches="tight")
     plt.close(figure)
 
 
-def plot_wavelength_comparison(
+def plot_optimum_shift_vs_wavelength(
     axis: plt.Axes,
     rows: list[dict[str, Any]],
     wavelengths_nm: tuple[float, ...],
-    diameter_mm: float,
     myopia_d: float,
+    config: SimulationConfig,
 ) -> None:
-    comparison_colours = ("#2457ff", "#d62728")
-    for wavelength_nm, colour in zip(wavelengths_nm, comparison_colours):
-        candidates = [
-            row
-            for row in rows
-            if row["wavelength_nm"] == wavelength_nm
-            and row["myopia_d"] == myopia_d
-        ]
-        row = min(
-            candidates,
-            key=lambda item: abs(item["diameter_mm"] - diameter_mm),
+    reference_nm = nearest_wavelength(config, config.primary_wavelength_nm)
+    reference_diameter_mm = simulated_optimum_diameter_mm(
+        rows, reference_nm, myopia_d
+    )
+    simulated_ratio = []
+    theory_ratio = []
+    for wavelength_nm in wavelengths_nm:
+        optimum_mm = simulated_optimum_diameter_mm(
+            rows, wavelength_nm, myopia_d
         )
-        wavelength_rows = rows_for_wavelength(rows, wavelength_nm)
-        diameters = sorted({item["diameter_mm"] for item in wavelength_rows})
-        values = []
-        for current_diameter in diameters:
-            current_candidates = [
-                item
-                for item in wavelength_rows
-                if item["myopia_d"] == myopia_d
-                and item["diameter_mm"] == current_diameter
-            ]
-            values.append(current_candidates[0]["log_mar"])
-        axis.plot(
-            diameters,
-            values,
-            color=colour,
-            linewidth=2.0,
-            label=f"{wavelength_nm:g} nm (nearest d = {row['diameter_mm']:.3f} mm)",
-        )
-        axis.axvline(
-            row["diameter_mm"],
-            color=colour,
-            linestyle=":",
-            linewidth=1.0,
-        )
-    axis.set_xscale("log")
-    axis.set_xlabel("Pinhole diameter d (mm)")
-    axis.set_ylabel("logMAR")
-    axis.set_title(f"Blue/red comparison at M = {myopia_d:g} D")
+        simulated_ratio.append(optimum_mm / reference_diameter_mm)
+        theory_ratio.append(math.sqrt(wavelength_nm / reference_nm))
+
+    axis.plot(
+        wavelengths_nm,
+        simulated_ratio,
+        marker="o",
+        color="#111111",
+        linewidth=2.0,
+        label="仿真 / Simulation",
+    )
+    axis.plot(
+        wavelengths_nm,
+        theory_ratio,
+        linestyle="--",
+        color="#d62728",
+        linewidth=1.8,
+        label="λ^0.5 理论 / λ^0.5 theory",
+    )
+    axis.set_xlabel("波长 / Wavelength (nm)")
+    axis.set_ylabel(
+        f"相对 d_opt / Relative d_opt\n（基准 / Reference: {reference_nm:g} nm）"
+    )
+    axis.set_title(
+        f"波长对最优孔径的影响 / Wavelength shift at M = {myopia_d:g} D"
+    )
     axis.grid(alpha=0.25)
     axis.legend()
 
 
-def save_comparison_figure(
-    output_paths: tuple[Path, ...],
+def plot_best_logmar_vs_wavelength(
+    axis: plt.Axes,
     rows: list[dict[str, Any]],
-    diameter_grids: dict[float, tuple[float, ...]],
-    myopia_values: tuple[float, ...],
+    wavelengths_nm: tuple[float, ...],
+    myopia_d: float,
     config: SimulationConfig,
 ) -> None:
-    comparison_wavelengths = tuple(
-        wavelength_nm
-        for wavelength_nm in config.wavelengths_nm
-        if wavelength_nm != config.primary_wavelength_nm
+    values = [
+        minimum_logmar(rows, wavelength_nm, myopia_d)
+        for wavelength_nm in wavelengths_nm
+    ]
+    axis.plot(
+        wavelengths_nm,
+        values,
+        marker="o",
+        color="#174ea6",
+        linewidth=2.0,
     )
-    if len(comparison_wavelengths) != 2:
-        raise ValueError("comparison figure expects exactly two non-primary wavelengths")
+    axis.set_xlabel("波长 / Wavelength (nm)")
+    axis.set_ylabel("最佳 logMAR / Best logMAR")
+    axis.set_title(
+        f"各波长最佳视锐度 / Best acuity at M = {myopia_d:g} D"
+    )
+    axis.grid(alpha=0.25)
 
+
+def build_wavelength_comparison_profiles(
+    config: SimulationConfig,
+    rows: list[dict[str, Any]],
+    aperture: cp.ndarray,
+    normalized_radius_squared: cp.ndarray,
+    myopia_d: float,
+) -> dict[float, tuple[list[float], list[float], float]]:
+    profiles: dict[float, tuple[list[float], list[float], float]] = {}
+    for wavelength_nm in config.wavelengths_nm:
+        optimum_mm = simulated_optimum_diameter_mm(
+            rows, wavelength_nm, myopia_d
+        )
+        sampling = build_sampling(config, wavelength_nm, optimum_mm)
+        psf = compute_psf(
+            config,
+            aperture,
+            normalized_radius_squared,
+            wavelength_nm,
+            optimum_mm,
+            myopia_d,
+        )
+        centre = config.grid_size // 2
+        host_profile = psf[centre, centre:].get().tolist()
+        max_index = min(
+            len(host_profile),
+            int(
+                math.ceil(
+                    config.comparison_profile_half_width_arcmin
+                    / sampling.angular_pixel_arcmin
+                )
+            )
+            + 1,
+        )
+        angles = [
+            index * sampling.angular_pixel_arcmin for index in range(max_index)
+        ]
+        floor = 10.0 ** (-config.comparison_profile_dynamic_range)
+        intensities = [
+            max(host_profile[index], floor) for index in range(max_index)
+        ]
+        profiles[wavelength_nm] = (angles, intensities, optimum_mm)
+    cp.cuda.Stream.null.synchronize()
+    return profiles
+
+
+def save_wavelength_comparison_figure(
+    output_path: Path,
+    rows: list[dict[str, Any]],
+    wavelengths_nm: tuple[float, ...],
+    myopia_values: tuple[float, ...],
+    profiles: dict[float, tuple[list[float], list[float], float]],
+    config: SimulationConfig,
+) -> None:
     figure = plt.figure(
         figsize=config.comparison_figure_size_inches, dpi=config.figure_dpi
     )
-    grid = figure.add_gridspec(2, 2, hspace=0.30, wspace=0.22)
-    left_axis = figure.add_subplot(grid[0, 0])
-    right_axis = figure.add_subplot(grid[0, 1])
-    curve_axis = figure.add_subplot(grid[1, 0])
-    note_axis = figure.add_subplot(grid[1, 1])
+    grid = figure.add_gridspec(2, 2, hspace=0.32, wspace=0.24)
+    optimum_axis = figure.add_subplot(grid[0, 0])
+    acuity_axis = figure.add_subplot(grid[0, 1])
+    shift_axis = figure.add_subplot(grid[1, 0])
+    profile_axis = figure.add_subplot(grid[1, 1])
 
-    blue_nm, red_nm = comparison_wavelengths
-    plot_logmar_heatmap(
-        left_axis,
-        rows,
-        blue_nm,
-        diameter_grids[blue_nm],
-        myopia_values,
-        config,
-    )
-    plot_logmar_heatmap(
-        right_axis,
-        rows,
-        red_nm,
-        diameter_grids[red_nm],
-        myopia_values,
-        config,
-    )
-    plot_wavelength_comparison(
-        curve_axis,
-        rows,
-        comparison_wavelengths,
-        config.validation_diameter_mm,
-        config.psf_snapshot_myopia_d,
-    )
     plot_optimal_diameter_curve(
-        note_axis,
+        optimum_axis,
         rows,
-        (blue_nm, red_nm),
+        wavelengths_nm,
         myopia_values,
         config,
+        show_theory_legend=False,
     )
+    optimum_axis.text(
+        0.98,
+        0.02,
+        "同色虚线 / Dotted curves: theory",
+        transform=optimum_axis.transAxes,
+        ha="right",
+        va="bottom",
+        fontsize=7,
+    )
+    plot_best_logmar_vs_wavelength(
+        acuity_axis,
+        rows,
+        wavelengths_nm,
+        config.psf_snapshot_myopia_d,
+        config,
+    )
+    plot_optimum_shift_vs_wavelength(
+        shift_axis,
+        rows,
+        wavelengths_nm,
+        config.psf_snapshot_myopia_d,
+        config,
+    )
+    for wavelength_nm in wavelengths_nm:
+        angles, intensities, optimum_mm = profiles[wavelength_nm]
+        profile_axis.semilogy(
+            angles,
+            intensities,
+            color=wavelength_colour(config, wavelength_nm),
+            linewidth=1.6,
+            label=f"{wavelength_nm:g} nm (d={optimum_mm:.3f} mm)",
+        )
+    profile_axis.set_xlabel("角半径 / Angular radius (arcmin)")
+    profile_axis.set_ylabel("归一化强度 / Normalized intensity")
+    profile_axis.set_title(
+        f"各波长最优 PSF 剖面 / PSF profiles at M = {config.psf_snapshot_myopia_d:g} D"
+    )
+    profile_axis.grid(alpha=0.25)
+    profile_axis.legend(fontsize=6, ncol=2)
+
     figure.suptitle(
-        f"Blue/red single-hole comparison: {blue_nm:g} nm and {red_nm:g} nm",
+        f"可见光 {len(wavelengths_nm)} 波长单孔 PSF 对比 / "
+        "Single-hole PSF comparison across visible wavelengths",
         fontsize=15,
     )
-    for output_path in output_paths:
-        figure.savefig(output_path, dpi=config.figure_dpi, bbox_inches="tight")
+    figure.savefig(output_path, dpi=config.figure_dpi, bbox_inches="tight")
     plt.close(figure)
 
 
@@ -1199,6 +1392,7 @@ def print_progress(
 
 def main() -> None:
     config = SimulationConfig()
+    configure_bilingual_plot_font()
     cp.cuda.Device(config.gpu_device_id).use()
     gpu_properties = cp.cuda.runtime.getDeviceProperties(config.gpu_device_id)
     gpu_name = gpu_properties["name"]
@@ -1206,13 +1400,19 @@ def main() -> None:
         gpu_name = gpu_name.decode()
 
     script_directory = Path(__file__).resolve().parent
-    output_directory = script_directory / config.output_directory_name
-    output_directory.mkdir(parents=True, exist_ok=True)
+    output_root = script_directory / config.output_root_directory_name
+    simulation_directory = output_root / config.simulation_directory_name
+    comparison_directory = (
+        simulation_directory / config.comparison_directory_name
+    )
+    simulation_directory.mkdir(parents=True, exist_ok=True)
+    comparison_directory.mkdir(parents=True, exist_ok=True)
 
+    wavelengths_nm = config.wavelengths_nm
     myopia_values = build_myopia_values(config)
     diameter_grids = {
         wavelength_nm: build_diameter_grid(config, wavelength_nm)
-        for wavelength_nm in config.wavelengths_nm
+        for wavelength_nm in wavelengths_nm
     }
     total_points = sum(len(grid) for grid in diameter_grids.values()) * len(
         myopia_values
@@ -1237,10 +1437,6 @@ def main() -> None:
         )
         for wavelength_nm, grid in diameter_grids.items()
     }
-    snapshot_diameters = representative_diameters_by_wavelength[
-        config.primary_wavelength_nm
-    ]
-
     rows: list[dict[str, Any]] = []
     snapshots: dict[tuple[float, float], cp.ndarray] = {}
     samplings: dict[tuple[float, float], OpticalSampling] = {}
@@ -1249,7 +1445,8 @@ def main() -> None:
 
     print(
         f"GPU: {gpu_name}; grid={config.grid_size}; "
-        f"points={total_points}; output={output_directory}",
+        f"wavelengths={len(wavelengths_nm)}; points={total_points}; "
+        f"output={simulation_directory}",
         flush=True,
     )
 
@@ -1257,7 +1454,7 @@ def main() -> None:
     for diameter_mm in sorted(
         {diameter for grid in diameter_grids.values() for diameter in grid}
     ):
-        for wavelength_nm in config.wavelengths_nm:
+        for wavelength_nm in wavelengths_nm:
             diameter_grid = diameter_grids[wavelength_nm]
             if diameter_mm not in diameter_grid:
                 continue
@@ -1328,8 +1525,7 @@ def main() -> None:
                 )
 
                 should_save_snapshot = (
-                    wavelength_nm in config.wavelengths_nm
-                    and diameter_mm
+                    diameter_mm
                     in representative_diameters_by_wavelength[wavelength_nm]
                     and myopia_d == config.psf_snapshot_myopia_d
                 )
@@ -1366,54 +1562,82 @@ def main() -> None:
     metrics_fields = list(rows[0].keys())
     validation_fields = list(validation_rows[0].keys())
     write_csv(
-        output_directory / config.metrics_filename,
+        simulation_directory / config.aggregate_metrics_filename,
         rows,
         metrics_fields,
     )
     write_csv(
-        output_directory / config.validation_filename,
+        simulation_directory / config.aggregate_validation_filename,
         validation_rows,
         validation_fields,
     )
 
     config_payload = asdict(config)
-    config_payload["real_dtype"] = str(config.real_dtype)
-    config_payload["complex_dtype"] = str(config.complex_dtype)
-    config_payload["accumulator_dtype"] = str(config.accumulator_dtype)
+    config_payload["real_dtype"] = config.real_dtype.__name__
+    config_payload["complex_dtype"] = config.complex_dtype.__name__
+    config_payload["accumulator_dtype"] = config.accumulator_dtype.__name__
     config_payload["gpu_name"] = gpu_name
-    with (output_directory / config.config_filename).open(
+    config_payload["wavelengths_nm"] = list(wavelengths_nm)
+    with (simulation_directory / config.config_filename).open(
         "w", encoding="utf-8"
     ) as file:
         json.dump(config_payload, file, ensure_ascii=False, indent=2)
 
-    primary_grid = diameter_grids[config.primary_wavelength_nm]
-    primary_output = output_directory / config.psf_figure_filename_template.format(
-        wavelength_nm=config.primary_wavelength_nm
-    )
-    save_primary_figure(
-        primary_output,
-        rows,
-        validation_rows,
-        primary_grid,
-        myopia_values,
-        snapshots,
-        snapshot_diameters,
-        samplings,
-        config,
-    )
-
-    comparison_outputs = tuple(
-        output_directory / config.psf_figure_filename_template.format(
-            wavelength_nm=wavelength_nm
+    for wavelength_nm in wavelengths_nm:
+        wavelength_directory = simulation_directory / (
+            config.wavelength_directory_name_template.format(
+                wavelength_nm=wavelength_nm
+            )
         )
-        for wavelength_nm in config.wavelengths_nm
-        if wavelength_nm != config.primary_wavelength_nm
-    )
-    save_comparison_figure(
-        comparison_outputs,
+        wavelength_directory.mkdir(parents=True, exist_ok=True)
+        wavelength_rows = rows_for_wavelength(rows, wavelength_nm)
+        wavelength_validation = [
+            row
+            for row in validation_rows
+            if row["wavelength_nm"] == wavelength_nm
+        ]
+        write_csv(
+            wavelength_directory / config.metrics_filename,
+            wavelength_rows,
+            metrics_fields,
+        )
+        write_csv(
+            wavelength_directory / config.validation_filename,
+            wavelength_validation,
+            validation_fields,
+        )
+        wavelength_output = (
+            wavelength_directory
+            / config.psf_figure_filename_template.format(
+                wavelength_nm=wavelength_nm
+            )
+        )
+        save_wavelength_figure(
+            wavelength_output,
+            rows,
+            validation_rows,
+            wavelength_nm,
+            diameter_grids[wavelength_nm],
+            myopia_values,
+            snapshots,
+            representative_diameters_by_wavelength[wavelength_nm],
+            samplings,
+            config,
+        )
+
+    comparison_profiles = build_wavelength_comparison_profiles(
+        config,
         rows,
-        diameter_grids,
+        aperture,
+        normalized_radius_squared,
+        config.psf_snapshot_myopia_d,
+    )
+    save_wavelength_comparison_figure(
+        comparison_directory / config.comparison_figure_filename,
+        rows,
+        wavelengths_nm,
         myopia_values,
+        comparison_profiles,
         config,
     )
 
@@ -1437,7 +1661,7 @@ def main() -> None:
         f"logMAR={best_row['log_mar']:.4f}",
         flush=True,
     )
-    print(f"Saved outputs to: {output_directory}", flush=True)
+    print(f"Saved outputs to: {simulation_directory}", flush=True)
 
 
 if __name__ == "__main__":

@@ -7,6 +7,7 @@ scipy>=1.11          # FFT、ndimage.label 数孔 QC、distance_transform_edt、
 matplotlib>=3.8      # 出图 (F1-F8)
 pandas>=2.0          # 仿真/实验 CSV 接口 (sim/exp 按 d,p join)
 scikit-image>=0.22   # regionprops 孔径分布 QC
+sympy>=1.12          # 理论公式推导与后续解析式检查
 
 # ---- GPU 加速 (RTX 5070 Ti 必装此版本以上) ----
 # 红线: >=13.4.0 才支持 CUDA 12.8 + Blackwell sm_120, 旧版报 no kernel image
@@ -15,5 +16,4 @@ cupy-cuda12x>=13.4
 # ---- 光学仿真库 ----
 diffractio           # 扩展源/多波长交叉验证 (注意: 现版 GPLv3, 结果仅作对照)
 diffractsim>=2.2.7   # 展示/出图, PolychromaticField 内置 CIE/D65, 支持 set_backend("CUDA")
-
 
