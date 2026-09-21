@@ -1009,6 +1009,7 @@ class ArrayGhostSimulationConfig:
     # 瞳孔渐晕：没有镜片到瞳孔距离时，权重取 1 并标记为几何上限。
     enable_pupil_vignetting: bool = False
     pupil_plane_distance_mm: float | None = None
+    default_pupil_plane_distance_mm: float = 12.0
 
     # --------------------------------------------------- 前两阶段结论复用
     reuse_previous_metrics: bool = True
@@ -1137,6 +1138,9 @@ class ArrayGhostSimulationConfig:
     shift_angle_tolerance_percent: float = 2.0
     first_order_angle_tolerance_percent: float = 5.0
     energy_relative_tolerance_percent: float = 0.1
+    mirror_symmetry_tolerance: float = 1.0e-3
+    cache_recompute_tolerance: float = 1.0e-6
+    exact_match_tolerance_percent: float = 1.0e-6
     solar_convergence_tolerance_percent: float = 2.0
     grid_convergence_tolerance_percent: float = 2.0
     grid_convergence_dense_factor: int = 2
@@ -1201,6 +1205,7 @@ class ArrayGhostSimulationConfig:
 
     # ------------------------------------------------------- 运行模式
     run_mode: str = "full"
+    progress_report_interval: int = 10
     quick_row_count: int = 5
     quick_column_count: int = 5
     quick_ring_count_values: tuple[int, ...] = (1, 2)
@@ -1415,6 +1420,8 @@ def validate_config(config: ArrayGhostSimulationConfig) -> None:
         )
     if config.grid_convergence_dense_factor < 2:
         raise ValueError("grid_convergence_dense_factor must be at least 2")
+    if config.progress_report_interval < 1:
+        raise ValueError("progress_report_interval must be positive")
 
     non_empty_tuples = {
         "myopia_values_d": config.myopia_values_d,
@@ -1483,6 +1490,8 @@ def validate_config(config: ArrayGhostSimulationConfig) -> None:
             )
         if config.pupil_plane_distance_mm < 0.0:
             raise ValueError("pupil_plane_distance_mm must be non-negative")
+    if config.default_pupil_plane_distance_mm < 0.0:
+        raise ValueError("default_pupil_plane_distance_mm must be non-negative")
 
     if config.psf_config.grid_size != config.psf_config.grid_size // 2 * 2:
         raise ValueError("psf_config.grid_size must be even")
@@ -3036,7 +3045,14 @@ def accumulate_shifted_kernels(
         )
         accumulated += float(weights[index]) * sampled
     total_energy = float(accumulated.sum(dtype=config.accumulator_dtype))
-    reference_weight = float(weights[0]) if weights.size else 1.0
+    # 参考主孔是孔心最靠近视场中心的那一个，不能假定它是数组第 0 项。
+    if shifts_arcmin.shape[0] > 0:
+        reference_index = int(
+            cp.argmin((shifts_arcmin**2).sum(axis=1)).item()
+        )
+        reference_weight = float(weights[reference_index])
+    else:
+        reference_weight = 1.0
     peak = float(accumulated.max())
     return {
         "image": accumulated.astype(config.real_dtype),
@@ -3526,6 +3542,1577 @@ def compute_ghost_metrics(
     metrics.update(autocorrelation)
     metrics.update(direction)
     return metrics, ghost_rows, clusters
+
+
+# ============================================================================
+# 实现部分 6/7：扫描编排、Pareto 前沿与 CSV 落盘
+# ============================================================================
+
+
+@dataclass
+class SolarKernelCache:
+    """按 (d, M, lambda) 缓存太阳盘卷积后的单孔像核与像宽。"""
+
+    kernel_by_key: dict[tuple[float, float, float], Any] = field(
+        default_factory=dict
+    )
+    width_by_key: dict[tuple[float, float, float], float] = field(
+        default_factory=dict
+    )
+    metadata_by_key: dict[tuple[float, float, float], dict[str, Any]] = field(
+        default_factory=dict
+    )
+    compute_count: int = 0
+    hit_count: int = 0
+
+    def get(
+        self,
+        config: ArrayGhostSimulationConfig,
+        psf_cache: PinholePsfCache,
+        diameter_mm: float,
+        myopia_d: float,
+        wavelength_nm: float,
+    ) -> tuple[Any, float, dict[str, Any]]:
+        key = psf_cache.key(diameter_mm, myopia_d, wavelength_nm)
+        if key in self.kernel_by_key:
+            self.hit_count += 1
+            return (
+                self.kernel_by_key[key],
+                self.width_by_key[key],
+                self.metadata_by_key[key],
+            )
+        psf, sampling = psf_cache.get(
+            config, diameter_mm, myopia_d, wavelength_nm
+        )
+        grid_size = config.effective_analysis_grid_size()
+        psf_grid = resample_psf_to_grid(
+            psf,
+            sampling.angular_pixel_arcmin,
+            grid_size,
+            config.analysis_pixel_arcmin,
+            config,
+        )
+        disk_kernel, disk_metadata = build_solar_disk_kernel(
+            config, grid_size, config.analysis_pixel_arcmin
+        )
+        kernel, convolution_metadata = convolve_with_solar_disk(
+            psf_grid, disk_kernel, config
+        )
+        width_arcmin = measure_image_width_arcmin(
+            kernel,
+            config.analysis_pixel_arcmin,
+            config.sun_width_energy_fraction,
+            config,
+        )
+        metadata = {
+            "psf_sampling_arcmin": sampling.angular_pixel_arcmin,
+            "analysis_grid_size": grid_size,
+            "analysis_pixel_arcmin": config.analysis_pixel_arcmin,
+            "sun_image_width_arcmin": width_arcmin,
+            **disk_metadata,
+            **convolution_metadata,
+        }
+        self.compute_count += 1
+        self.kernel_by_key[key] = kernel
+        self.width_by_key[key] = width_arcmin
+        self.metadata_by_key[key] = metadata
+        return kernel, width_arcmin, metadata
+
+
+@dataclass(frozen=True)
+class ScanPoint:
+    """一次阵列重影评估的全部输入。"""
+
+    comparison_group: str
+    layout: ArrayLayout
+    diameter_mm: float
+    pitch_mm: float
+    pupil_diameter_mm: float
+    myopia_d: float
+    wavelength_nm: float
+    anchor_source: str
+    enable_pupil_vignetting: bool = False
+    pupil_plane_distance_mm: float | None = None
+
+
+def diameter_for_area_fraction(
+    pattern_kind: str,
+    pitch_mm: float,
+    target_area_fraction: float,
+) -> float:
+    """方案 2.8 节：固定面积分数时反解孔径。"""
+    unit_cell_factor = {
+        ARRAY_PATTERN_SQUARE_PACKING: math.pi / 4.0,
+        ARRAY_PATTERN_TRIANGULAR_PACKING: math.pi / (2.0 * math.sqrt(3.0)),
+        ARRAY_PATTERN_HEXAGONAL_PACKING: math.pi / (4.0 * 0.75 * math.sqrt(3.0)),
+    }.get(pattern_kind)
+    if unit_cell_factor is None or unit_cell_factor <= 0.0:
+        return math.nan
+    if not 0.0 < target_area_fraction < unit_cell_factor:
+        return math.nan
+    return pitch_mm * math.sqrt(target_area_fraction / unit_cell_factor)
+
+
+def build_layout_for_pattern(
+    config: ArrayGhostSimulationConfig,
+    pattern_kind: str,
+    pitch_mm: float,
+    diameter_mm: float,
+    ring_count: int,
+    holes_per_ring: Sequence[int] | None = None,
+) -> ArrayLayout:
+    if pattern_kind == ARRAY_PATTERN_SQUARE_PACKING:
+        return generate_square_packing(config, pitch_mm, diameter_mm)
+    if pattern_kind == ARRAY_PATTERN_TRIANGULAR_PACKING:
+        return generate_triangular_packing(config, pitch_mm, diameter_mm)
+    if pattern_kind == ARRAY_PATTERN_HEXAGONAL_PACKING:
+        return generate_hexagonal_packing(config, pitch_mm, diameter_mm)
+    if pattern_kind == ARRAY_PATTERN_HEXAGONAL_RINGS:
+        return generate_hexagonal_rings(
+            config, pitch_mm, diameter_mm, ring_count
+        )
+    if pattern_kind == ARRAY_PATTERN_CIRCULAR_RINGS:
+        return generate_circular_rings(config, pitch_mm, diameter_mm, holes_per_ring)
+    raise ValueError(f"unsupported array_pattern_kind: {pattern_kind!r}")
+
+
+def enumerate_scan_points(
+    config: ArrayGhostSimulationConfig,
+    anchors: dict[str, Any],
+) -> list[ScanPoint]:
+    """方案第 8 节的扫描编排：分层小样本，不把全组合一次性展开。"""
+    points: list[ScanPoint] = []
+    representative_myopia_d = config.quick_myopia_values_d[0] if config.quick_mode else config.representative_myopia_d
+    primary_diameter_mm, anchor_source = reference_diameter_mm(
+        config, anchors, representative_myopia_d, config.primary_wavelength_nm
+    )
+    default_pupil_mm = max(config.pupil_diameter_values_mm)
+    pattern_order = (
+        ARRAY_PATTERN_SQUARE_PACKING,
+        ARRAY_PATTERN_TRIANGULAR_PACKING,
+        ARRAY_PATTERN_HEXAGONAL_PACKING,
+        ARRAY_PATTERN_HEXAGONAL_RINGS,
+        ARRAY_PATTERN_CIRCULAR_RINGS,
+    )
+
+    # 组一：固定孔数，比较排布拓扑。
+    for pattern_kind in pattern_order:
+        for pitch_mm in config.effective_pitch_values_mm():
+            layout = build_layout_for_pattern(
+                config,
+                pattern_kind,
+                pitch_mm,
+                primary_diameter_mm,
+                ring_count=max(config.effective_ring_count_values()),
+            )
+            points.append(
+                ScanPoint(
+                    comparison_group="fixed_hole_count_layout",
+                    layout=layout,
+                    diameter_mm=primary_diameter_mm,
+                    pitch_mm=pitch_mm,
+                    pupil_diameter_mm=default_pupil_mm,
+                    myopia_d=representative_myopia_d,
+                    wavelength_nm=config.primary_wavelength_nm,
+                    anchor_source=anchor_source,
+                )
+            )
+
+    # 组二：固定面积分数，比较真实减光条件下的重影。
+    target_area_fraction = analytic_area_fraction(
+        ARRAY_PATTERN_SQUARE_PACKING, primary_diameter_mm, 2.0
+    )
+    for pattern_kind in pattern_order[:3]:
+        for pitch_mm in config.effective_pitch_values_mm():
+            diameter_mm = diameter_for_area_fraction(
+                pattern_kind, pitch_mm, target_area_fraction
+            )
+            if not math.isfinite(diameter_mm):
+                continue
+            if pitch_mm - diameter_mm < config.minimum_edge_clearance_mm:
+                continue
+            layout = build_layout_for_pattern(
+                config, pattern_kind, pitch_mm, diameter_mm, ring_count=1
+            )
+            points.append(
+                ScanPoint(
+                    comparison_group="fixed_area_fraction_layout",
+                    layout=layout,
+                    diameter_mm=diameter_mm,
+                    pitch_mm=pitch_mm,
+                    pupil_diameter_mm=default_pupil_mm,
+                    myopia_d=representative_myopia_d,
+                    wavelength_nm=config.primary_wavelength_nm,
+                    anchor_source=anchor_source,
+                )
+            )
+
+    # 组三：固定 p 与 d，只增加环数，观察重影从离散点扩展到环状。
+    for pattern_kind in (ARRAY_PATTERN_HEXAGONAL_RINGS, ARRAY_PATTERN_CIRCULAR_RINGS):
+        for ring_count in config.effective_ring_count_values():
+            layout = build_layout_for_pattern(
+                config,
+                pattern_kind,
+                min(config.effective_pitch_values_mm()),
+                primary_diameter_mm,
+                ring_count=ring_count,
+            )
+            points.append(
+                ScanPoint(
+                    comparison_group="ring_growth",
+                    layout=layout,
+                    diameter_mm=primary_diameter_mm,
+                    pitch_mm=min(config.effective_pitch_values_mm()),
+                    pupil_diameter_mm=default_pupil_mm,
+                    myopia_d=representative_myopia_d,
+                    wavelength_nm=config.primary_wavelength_nm,
+                    anchor_source=anchor_source,
+                )
+            )
+
+    # 组四：文档设计点 A、B、C，并做瞳孔直径敏感性。
+    for label, diameter_mm, pitch_mm in zip(
+        config.design_point_labels,
+        config.design_point_diameter_mm,
+        config.design_point_pitch_mm,
+    ):
+        for pattern_kind in pattern_order:
+            layout = build_layout_for_pattern(
+                config,
+                pattern_kind,
+                pitch_mm,
+                diameter_mm,
+                ring_count=max(config.effective_ring_count_values()),
+            )
+            points.append(
+                ScanPoint(
+                    comparison_group=f"design_point_{label}",
+                    layout=layout,
+                    diameter_mm=diameter_mm,
+                    pitch_mm=pitch_mm,
+                    pupil_diameter_mm=default_pupil_mm,
+                    myopia_d=representative_myopia_d,
+                    wavelength_nm=config.primary_wavelength_nm,
+                    anchor_source="document_design_point",
+                )
+            )
+
+    # 组五：瞳孔直径敏感性。开启瞳孔权重后，只有落在瞳孔内的孔参与成像。
+    vignetting_config = replace(
+        config,
+        enable_pupil_vignetting=True,
+        pupil_plane_distance_mm=(
+            config.pupil_plane_distance_mm
+            if config.pupil_plane_distance_mm is not None
+            else config.default_pupil_plane_distance_mm
+        ),
+    )
+    for label, diameter_mm, pitch_mm in zip(
+        config.design_point_labels,
+        config.design_point_diameter_mm,
+        config.design_point_pitch_mm,
+    ):
+        for pupil_diameter_mm in config.pupil_diameter_values_mm:
+            layout = build_layout_for_pattern(
+                vignetting_config,
+                ARRAY_PATTERN_SQUARE_PACKING,
+                pitch_mm,
+                diameter_mm,
+                ring_count=1,
+            )
+            points.append(
+                ScanPoint(
+                    comparison_group=f"pupil_study_{label}",
+                    layout=layout,
+                    diameter_mm=diameter_mm,
+                    pitch_mm=pitch_mm,
+                    pupil_diameter_mm=pupil_diameter_mm,
+                    myopia_d=representative_myopia_d,
+                    wavelength_nm=config.primary_wavelength_nm,
+                    anchor_source="pupil_limited_design_point",
+                    enable_pupil_vignetting=True,
+                    pupil_plane_distance_mm=vignetting_config.pupil_plane_distance_mm,
+                )
+            )
+
+    # 组六：d-p 精细网格，只在 d_opt 邻域内扫描。
+    for myopia_d in config.effective_myopia_values_d():
+        diameters, grid_anchor_source = build_diameter_anchor_grid(
+            config, anchors, myopia_d, config.primary_wavelength_nm
+        )
+        for diameter_mm in diameters:
+            for pitch_mm in build_pitch_grid(config, diameter_mm):
+                for pattern_kind in pattern_order[:3]:
+                    layout = build_layout_for_pattern(
+                        config, pattern_kind, pitch_mm, diameter_mm, ring_count=1
+                    )
+                    points.append(
+                        ScanPoint(
+                            comparison_group="diameter_pitch_grid",
+                            layout=layout,
+                            diameter_mm=diameter_mm,
+                            pitch_mm=pitch_mm,
+                            pupil_diameter_mm=default_pupil_mm,
+                            myopia_d=myopia_d,
+                            wavelength_nm=config.primary_wavelength_nm,
+                            anchor_source=grid_anchor_source,
+                        )
+                    )
+
+    # 组七：波长敏感性，只在代表点上做。
+    if not config.quick_mode:
+        for wavelength_nm in config.spectral_wavelengths_nm:
+            diameter_mm, wavelength_source = reference_diameter_mm(
+                config, anchors, representative_myopia_d, wavelength_nm
+            )
+            layout = build_layout_for_pattern(
+                config,
+                ARRAY_PATTERN_SQUARE_PACKING,
+                pitch_mm=2.0,
+                diameter_mm=diameter_mm,
+                ring_count=1,
+            )
+            points.append(
+                ScanPoint(
+                    comparison_group="wavelength_study",
+                    layout=layout,
+                    diameter_mm=diameter_mm,
+                    pitch_mm=2.0,
+                    pupil_diameter_mm=default_pupil_mm,
+                    myopia_d=representative_myopia_d,
+                    wavelength_nm=wavelength_nm,
+                    anchor_source=wavelength_source,
+                )
+            )
+    return points
+
+
+GHOST_METRIC_FIELDS: tuple[str, ...] = (
+    "comparison_group",
+    "pattern_kind",
+    "hole_count",
+    "diameter_mm",
+    "pitch_mm",
+    "pitch_to_diameter_ratio",
+    "edge_clearance_mm",
+    "pupil_diameter_mm",
+    "weight_model",
+    "reference_weight",
+    "myopia_d",
+    "wavelength_nm",
+    "anchor_source",
+    "ring_count",
+    "holes_per_ring",
+    "ghost_count",
+    "ghost_cluster_count",
+    "unique_overlap_count",
+    "max_ghost_multiplicity",
+    "first_order_angle_arcmin",
+    "theory_first_order_angle_arcmin",
+    "first_order_angle_error_percent",
+    "max_ghost_peak_ratio",
+    "ghost_integrated_fraction",
+    "sun_image_width_arcmin",
+    "separation_to_width_ratio",
+    "valley_visibility",
+    "valley_status",
+    "main_peak",
+    "image_total_energy",
+    "energy_relative_error_percent",
+    "field_grid_size",
+    "field_pixel_arcmin",
+    "field_pixels_per_image_width",
+    "field_grid_coarsened",
+    "direction_anisotropy",
+    "direction_occupied_bin_count",
+    "autocorrelation_peak_to_median",
+    "autocorrelation_max_offcentre_radius_arcmin",
+    "autocorrelation_max_offcentre_value",
+    "direction_histogram",
+    "primary_risk_label",
+    "risk_labels",
+    "geometry_ok",
+    "topology_ok",
+    "mask_ok",
+    "mask_relative_area_error",
+    "ghost_positions",
+    "pattern_signature",
+)
+
+
+def evaluate_scan_point(
+    config: ArrayGhostSimulationConfig,
+    point: ScanPoint,
+    psf_cache: PinholePsfCache,
+    kernel_cache: SolarKernelCache,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """评估一个扫描点，返回指标行与该点的全部重影峰行。"""
+    kernel, image_width_arcmin, _kernel_metadata = kernel_cache.get(
+        config,
+        psf_cache,
+        point.diameter_mm,
+        point.myopia_d,
+        point.wavelength_nm,
+    )
+    weight_config = (
+        config
+        if not point.enable_pupil_vignetting
+        else replace(
+            config,
+            enable_pupil_vignetting=True,
+            pupil_plane_distance_mm=point.pupil_plane_distance_mm,
+        )
+    )
+    weights_np, weight_model = compute_hole_weights(
+        point.layout, point.pupil_diameter_mm, weight_config
+    )
+    shifts_np = (
+        point.layout.centers_mm
+        / config.focal_length_mm
+        * ARCMINUTES_PER_RADIAN
+    )
+    shifts = cp.asarray(shifts_np, dtype=cp.float32)
+    weights = cp.asarray(weights_np, dtype=config.accumulator_dtype)
+    field = plan_field_grid(shifts, image_width_arcmin, config)
+    image_result = accumulate_shifted_kernels(
+        kernel,
+        config.analysis_pixel_arcmin,
+        shifts,
+        weights,
+        field,
+        config,
+    )
+    theory_first_order_angle_arcmin = (
+        point.pitch_mm / config.focal_length_mm * ARCMINUTES_PER_RADIAN
+    )
+    metrics, ghost_rows, _clusters = compute_ghost_metrics(
+        image_result,
+        field,
+        shifts_np,
+        weights_np,
+        image_width_arcmin,
+        theory_first_order_angle_arcmin,
+        config,
+    )
+    layout_qc = validate_layout(point.layout, config)
+    mask_geometry = rasterize_mask(point.layout, config)
+    mask_qc = validate_mask(mask_geometry, point.layout, config)
+    primary_label, risk_labels = classify_risk_labels(
+        layout_qc,
+        metrics,
+        point.pupil_diameter_mm,
+        image_result["reference_weight"],
+        config,
+    )
+
+    row: dict[str, Any] = {
+        "comparison_group": point.comparison_group,
+        "pattern_kind": point.layout.pattern_kind,
+        "hole_count": point.layout.hole_count,
+        "diameter_mm": point.diameter_mm,
+        "pitch_mm": point.pitch_mm,
+        "pitch_to_diameter_ratio": point.pitch_mm / point.diameter_mm,
+        "pupil_diameter_mm": point.pupil_diameter_mm,
+        "weight_model": weight_model,
+        "reference_weight": image_result["reference_weight"],
+        "myopia_d": point.myopia_d,
+        "wavelength_nm": point.wavelength_nm,
+        "anchor_source": point.anchor_source,
+        "primary_risk_label": primary_label,
+        "risk_labels": risk_labels,
+        "edge_clearance_mm": layout_qc["edge_clearance_mm"],
+        "ring_count": point.layout.ring_count,
+        "holes_per_ring": "|".join(
+            str(value) for value in point.layout.holes_per_ring
+        ),
+        "geometry_ok": layout_qc["geometry_ok"],
+        "topology_ok": layout_qc["topology_ok"],
+        "mask_ok": mask_qc["mask_ok"],
+        "mask_relative_area_error": mask_qc["relative_area_error"],
+    }
+    row.update(metrics)
+
+    peak_rows: list[dict[str, Any]] = []
+    for ghost_row in ghost_rows:
+        peak_rows.append(
+            {
+                "comparison_group": point.comparison_group,
+                "pattern_kind": point.layout.pattern_kind,
+                "diameter_mm": point.diameter_mm,
+                "pitch_mm": point.pitch_mm,
+                "pupil_diameter_mm": point.pupil_diameter_mm,
+                "myopia_d": point.myopia_d,
+                "wavelength_nm": point.wavelength_nm,
+                "ring_count": point.layout.ring_count,
+                **ghost_row,
+            }
+        )
+    return row, peak_rows
+
+
+def compute_pareto_front(
+    rows: Sequence[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """方案 2.9 节：分离比、峰比与融合度的非支配集。"""
+    candidates = [
+        row
+        for row in rows
+        if row["comparison_group"] == "diameter_pitch_grid"
+        and row["geometry_ok"]
+        and math.isfinite(row["separation_to_width_ratio"])
+    ]
+    front: list[dict[str, Any]] = []
+    for candidate in candidates:
+        dominated = False
+        for other in candidates:
+            if other is candidate:
+                continue
+            better_or_equal = (
+                other["separation_to_width_ratio"]
+                >= candidate["separation_to_width_ratio"]
+                and other["max_ghost_peak_ratio"]
+                <= candidate["max_ghost_peak_ratio"]
+                and other["valley_visibility"]
+                >= candidate["valley_visibility"]
+            )
+            strictly_better = (
+                other["separation_to_width_ratio"]
+                > candidate["separation_to_width_ratio"]
+                or other["max_ghost_peak_ratio"]
+                < candidate["max_ghost_peak_ratio"]
+                or other["valley_visibility"]
+                > candidate["valley_visibility"]
+            )
+            if better_or_equal and strictly_better:
+                dominated = True
+                break
+        if not dominated:
+            front.append(candidate)
+    return front
+
+
+PATTERN_SELECTION_FIELDS: tuple[str, ...] = (
+    "pattern_kind",
+    "pitch_mm",
+    "pitch_to_diameter_ratio",
+    "pitch_to_focal_length",
+    "geometry_ok",
+    "topology_ok",
+)
+
+
+def build_pattern_selection_rows(
+    config: ArrayGhostSimulationConfig,
+    anchors: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """d-p 扫描的合法区域：先出几何矩阵，再进入光学计算。"""
+    rows: list[dict[str, Any]] = []
+    myopia_d = (
+        config.quick_myopia_values_d[0]
+        if config.quick_mode
+        else config.representative_myopia_d
+    )
+    diameters, _ = build_diameter_anchor_grid(
+        config, anchors, myopia_d, config.primary_wavelength_nm
+    )
+    for pattern_kind in (
+        ARRAY_PATTERN_SQUARE_PACKING,
+        ARRAY_PATTERN_TRIANGULAR_PACKING,
+        ARRAY_PATTERN_HEXAGONAL_PACKING,
+    ):
+        for diameter_mm in diameters:
+            for pitch_mm in build_pitch_grid(config, diameter_mm):
+                layout = build_layout_for_pattern(
+                    config, pattern_kind, pitch_mm, diameter_mm, ring_count=1
+                )
+                qc = validate_layout(layout, config)
+                rows.append(
+                    {
+                        "pattern_kind": pattern_kind,
+                        "diameter_mm": diameter_mm,
+                        "pitch_mm": pitch_mm,
+                        "pitch_to_diameter_ratio": pitch_mm / diameter_mm,
+                        "pitch_to_focal_length": pitch_mm
+                        / config.focal_length_mm,
+                        "geometry_ok": qc["geometry_ok"],
+                        "topology_ok": qc["topology_ok"],
+                    }
+                )
+    return rows
+
+
+def build_coarse_check_rows(
+    config: ArrayGhostSimulationConfig,
+    anchors: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """方案 2.9 节的对照层：远离 d_opt 的低分辨率解析对照。
+
+    这一层只做解析几何检查，用来确认前两阶段没有漏掉值得复查的孔径区，
+    不能与 refined 网格混在同一张主图里。
+    """
+    rows: list[dict[str, Any]] = []
+    myopia_d = (
+        config.quick_myopia_values_d[0]
+        if config.quick_mode
+        else config.representative_myopia_d
+    )
+    reference_mm, _source = reference_diameter_mm(
+        config, anchors, myopia_d, config.primary_wavelength_nm
+    )
+    for factor in config.coarse_diameter_check_factors:
+        diameter_mm = reference_mm * factor
+        for pattern_kind in (
+            ARRAY_PATTERN_SQUARE_PACKING,
+            ARRAY_PATTERN_TRIANGULAR_PACKING,
+            ARRAY_PATTERN_HEXAGONAL_PACKING,
+        ):
+            for pitch_mm in config.coarse_check_pitch_values_mm:
+                area_fraction = analytic_area_fraction(
+                    pattern_kind, diameter_mm, pitch_mm
+                )
+                rows.append(
+                    {
+                        "pattern_kind": pattern_kind,
+                        "diameter_mm": diameter_mm,
+                        "diameter_factor_vs_anchor": factor,
+                        "pitch_mm": pitch_mm,
+                        "pitch_to_diameter_ratio": pitch_mm / diameter_mm,
+                        "pitch_to_focal_length": pitch_mm
+                        / config.focal_length_mm,
+                        "edge_clearance_mm": pitch_mm - diameter_mm,
+                        "analytic_area_fraction": area_fraction,
+                        "geometry_ok": (
+                            pitch_mm - diameter_mm
+                            >= config.minimum_edge_clearance_mm
+                        ),
+                        "reuse_status": "coarse_check_only",
+                    }
+                )
+    return rows
+
+
+def build_ring_geometry_rows(
+    config: ArrayGhostSimulationConfig,
+    anchors: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """方案第 9 节：ring_geometry.csv 的每一行。"""
+    rows: list[dict[str, Any]] = []
+    myopia_d = (
+        config.quick_myopia_values_d[0]
+        if config.quick_mode
+        else config.representative_myopia_d
+    )
+    diameter_mm, _ = reference_diameter_mm(
+        config, anchors, myopia_d, config.primary_wavelength_nm
+    )
+    for pattern_kind in (
+        ARRAY_PATTERN_HEXAGONAL_RINGS,
+        ARRAY_PATTERN_CIRCULAR_RINGS,
+    ):
+        for pitch_mm in config.effective_pitch_values_mm():
+            for ring_count in config.effective_ring_count_values():
+                layout = build_layout_for_pattern(
+                    config,
+                    pattern_kind,
+                    pitch_mm,
+                    diameter_mm,
+                    ring_count=ring_count,
+                )
+                qc = validate_layout(layout, config)
+                rows.append(
+                    {
+                        "pattern_kind": pattern_kind,
+                        "pitch_mm": pitch_mm,
+                        "diameter_mm": diameter_mm,
+                        "ring_count": layout.ring_count,
+                        "hole_count": layout.hole_count,
+                        "holes_per_ring": "|".join(
+                            str(value) for value in layout.holes_per_ring
+                        ),
+                        "ring_radii_mm": "|".join(
+                            f"{value:.6f}" for value in layout.ring_radii_mm
+                        ),
+                        "ring_radial_pitch_mm": layout.ring_radial_pitch_mm,
+                        "nearest_neighbor_min_mm": qc["nearest_neighbor_min_mm"],
+                        "edge_clearance_mm": qc["edge_clearance_mm"],
+                        "geometry_ok": qc["geometry_ok"],
+                    }
+                )
+    return rows
+
+
+RING_GEOMETRY_FIELDS: tuple[str, ...] = (
+    "pattern_kind",
+    "pitch_mm",
+    "diameter_mm",
+    "ring_count",
+    "hole_count",
+    "holes_per_ring",
+    "ring_radii_mm",
+    "ring_radial_pitch_mm",
+    "nearest_neighbor_min_mm",
+    "edge_clearance_mm",
+    "geometry_ok",
+)
+
+GHOST_PEAK_FIELDS: tuple[str, ...] = (
+    "comparison_group",
+    "pattern_kind",
+    "diameter_mm",
+    "pitch_mm",
+    "pupil_diameter_mm",
+    "myopia_d",
+    "wavelength_nm",
+    "ring_count",
+    "ghost_index",
+    "ghost_x_arcmin",
+    "ghost_y_arcmin",
+    "ghost_radius_arcmin",
+    "ghost_azimuth_deg",
+    "multiplicity",
+    "total_weight",
+    "measured_peak",
+    "peak_ratio",
+    "above_visibility_threshold",
+)
+
+PATTERN_SELECTION_FULL_FIELDS: tuple[str, ...] = (
+    "pattern_kind",
+    "diameter_mm",
+    "pitch_mm",
+    "pitch_to_diameter_ratio",
+    "pitch_to_focal_length",
+    "geometry_ok",
+    "topology_ok",
+)
+
+
+VALIDATION_FIELDS: tuple[str, ...] = (
+    "anchor_id",
+    "description",
+    "measured",
+    "expected",
+    "relative_error_percent",
+    "tolerance_percent",
+    "tolerance_absolute",
+    "passed",
+    "notes",
+)
+
+
+def _validation_row(
+    anchor_id: str,
+    description: str,
+    measured: float,
+    expected: float,
+    tolerance_percent: float,
+    notes: str = "",
+    tolerance_absolute: float | None = None,
+) -> dict[str, Any]:
+    """一行验证结果。
+
+    期望值为 0 的锚点（例如峰间谷值、镜像不对称）不能用相对误差判定，
+    这类锚点必须传入 tolerance_absolute，按绝对差判定。
+    """
+    if tolerance_absolute is not None:
+        absolute_error = abs(measured - expected)
+        relative_error_percent = math.nan
+        passed = bool(
+            math.isfinite(absolute_error) and absolute_error <= tolerance_absolute
+        )
+    elif math.isfinite(measured) and math.isfinite(expected) and expected != 0.0:
+        relative_error_percent = 100.0 * abs(measured - expected) / abs(expected)
+        passed = bool(
+            math.isfinite(relative_error_percent)
+            and relative_error_percent <= tolerance_percent
+        )
+    else:
+        relative_error_percent = math.nan
+        passed = False
+    return {
+        "anchor_id": anchor_id,
+        "description": description,
+        "measured": measured,
+        "expected": expected,
+        "relative_error_percent": relative_error_percent,
+        "tolerance_percent": tolerance_percent,
+        "tolerance_absolute": (
+            tolerance_absolute if tolerance_absolute is not None else math.nan
+        ),
+        "passed": passed,
+        "notes": notes,
+    }
+
+
+def build_validation_rows(
+    config: ArrayGhostSimulationConfig,
+    anchors: dict[str, Any],
+    psf_cache: PinholePsfCache,
+    kernel_cache: SolarKernelCache,
+) -> list[dict[str, Any]]:
+    """方案第 10 节：V-A 到 V-K 的数值锚点。"""
+    rows: list[dict[str, Any]] = []
+    myopia_d = (
+        config.quick_myopia_values_d[0]
+        if config.quick_mode
+        else config.representative_myopia_d
+    )
+    diameter_mm, anchor_source = reference_diameter_mm(
+        config, anchors, myopia_d, config.primary_wavelength_nm
+    )
+    pitch_mm = 2.0
+
+    # V-A 掩膜面积与连通域。
+    for pattern_kind in (
+        ARRAY_PATTERN_SQUARE_PACKING,
+        ARRAY_PATTERN_TRIANGULAR_PACKING,
+        ARRAY_PATTERN_HEXAGONAL_PACKING,
+    ):
+        layout = build_layout_for_pattern(
+            config, pattern_kind, pitch_mm, diameter_mm, ring_count=1
+        )
+        mask_geometry = rasterize_mask(layout, config)
+        mask_qc = validate_mask(mask_geometry, layout, config)
+        rows.append(
+            _validation_row(
+                f"V-A-{pattern_kind}",
+                "mask numeric area vs analytic circle area",
+                mask_qc["relative_area_error"] * 100.0,
+                0.0,
+                config.mask_area_relative_tolerance * 100.0,
+                notes=(
+                    f"components={mask_qc['labeled_hole_count']}/"
+                    f"{mask_qc['designed_hole_count']}, "
+                    f"min_circularity={mask_qc['min_circularity']:.4f}"
+                ),
+                tolerance_absolute=config.mask_area_relative_tolerance * 100.0,
+            )
+        )
+
+    kernel, image_width_arcmin, _metadata = kernel_cache.get(
+        config, psf_cache, diameter_mm, myopia_d, config.primary_wavelength_nm
+    )
+    theory_first_order_angle_arcmin = (
+        pitch_mm / config.focal_length_mm * ARCMINUTES_PER_RADIAN
+    )
+
+    # V-B 平移与重影角，V-E 双孔解析，V-F 能量。
+    layout = build_layout_for_pattern(
+        config, ARRAY_PATTERN_SQUARE_PACKING, pitch_mm, diameter_mm, ring_count=1
+    )
+    shifts_np = (
+        layout.centers_mm / config.focal_length_mm * ARCMINUTES_PER_RADIAN
+    )
+    weights_np, _weight_model = compute_hole_weights(layout, None, config)
+    shifts = cp.asarray(shifts_np, dtype=cp.float32)
+    weights = cp.asarray(weights_np, dtype=config.accumulator_dtype)
+    field = plan_field_grid(shifts, image_width_arcmin, config)
+    image_result = accumulate_shifted_kernels(
+        kernel,
+        config.analysis_pixel_arcmin,
+        shifts,
+        weights,
+        field,
+        config,
+    )
+    metrics, _ghosts, _clusters = compute_ghost_metrics(
+        image_result,
+        field,
+        shifts_np,
+        weights_np,
+        image_width_arcmin,
+        theory_first_order_angle_arcmin,
+        config,
+    )
+    rows.append(
+        _validation_row(
+            "V-B-first-order-angle",
+            "first-order ghost angle vs p / f",
+            metrics["first_order_angle_arcmin"],
+            theory_first_order_angle_arcmin,
+            config.first_order_angle_tolerance_percent,
+            notes=f"pattern={layout.pattern_kind}",
+        )
+    )
+    rows.append(
+        _validation_row(
+            "V-F-energy",
+            "image total energy vs sum of hole weights",
+            metrics["image_total_energy"],
+            image_result["expected_energy"],
+            config.energy_relative_tolerance_percent,
+            notes=f"holes={layout.hole_count}",
+        )
+    )
+
+    single_index = int(np.argmin((shifts_np**2).sum(axis=1)))
+    single_shift = shifts[single_index : single_index + 1]
+    single_weights = weights[single_index : single_index + 1]
+    single_field = plan_field_grid(single_shift, image_width_arcmin, config)
+    single_result = accumulate_shifted_kernels(
+        kernel,
+        config.analysis_pixel_arcmin,
+        single_shift,
+        single_weights,
+        single_field,
+        config,
+    )
+    rows.append(
+        _validation_row(
+            "V-D-single-hole-degeneration",
+            "single central hole returns unit energy at field centre",
+            single_result["total_energy"],
+            1.0,
+            config.energy_relative_tolerance_percent,
+            notes="one-hole layout must equal the single-hole kernel",
+        )
+    )
+
+    pair_centers_mm = np.asarray(
+        [[-0.5 * pitch_mm, 0.0], [0.5 * pitch_mm, 0.0]], dtype=np.float64
+    )
+    pair_shifts_np = (
+        pair_centers_mm / config.focal_length_mm * ARCMINUTES_PER_RADIAN
+    )
+    pair_shifts = cp.asarray(pair_shifts_np, dtype=cp.float32)
+    pair_weights = cp.ones((2,), dtype=config.accumulator_dtype)
+    pair_field = plan_field_grid(pair_shifts, image_width_arcmin, config)
+    pair_result = accumulate_shifted_kernels(
+        kernel,
+        config.analysis_pixel_arcmin,
+        pair_shifts,
+        pair_weights,
+        pair_field,
+        config,
+    )
+    pair_image = pair_result["image"]
+    pair_separation = abs(float(pair_shifts_np[1, 0] - pair_shifts_np[0, 0]))
+    rows.append(
+        _validation_row(
+            "V-E-two-hole-separation",
+            "symmetric two-hole pair separation vs p / f",
+            pair_separation,
+            theory_first_order_angle_arcmin,
+            config.first_order_angle_tolerance_percent,
+            notes="pair is placed symmetrically about the reference centre",
+        )
+    )
+    centre_index = pair_field["grid_size"] // 2
+    rows.append(
+        _validation_row(
+            "V-E-two-hole-centre-null",
+            "image at the midpoint of a symmetric pair",
+            float(pair_image[centre_index, centre_index])
+            / float(pair_image.max()),
+            0.0,
+            0.0,
+            notes=(
+                "midpoint value must be far below the two ghost peaks; "
+                f"peak={float(pair_image.max()):.6g}"
+            ),
+            tolerance_absolute=config.visibility_peak_threshold,
+        )
+    )
+
+    # V-C 非相干叠加：孔间不得出现干涉条纹。
+    mirrored_pair = cp.roll(pair_image[::-1, :], 1, axis=0)
+    mirror_peak = float(pair_image.max())
+    rows.append(
+        _validation_row(
+            "V-C-incoherent-sum",
+            "two identical holes show no periodic interference modulation",
+            float(cp.abs(pair_image - mirrored_pair).max()) / mirror_peak,
+            0.0,
+            0.0,
+            notes="mirror symmetry holds for intensity summation only",
+            tolerance_absolute=config.mirror_symmetry_tolerance,
+        )
+    )
+
+    # V-G 太阳源收敛：圆盘卷积与稠密方向积分。
+    psf, sampling = psf_cache.get(
+        config, diameter_mm, myopia_d, config.primary_wavelength_nm
+    )
+    grid_size = 256
+    psf_grid = resample_psf_to_grid(
+        psf,
+        sampling.angular_pixel_arcmin,
+        grid_size,
+        config.analysis_pixel_arcmin,
+        config,
+    )
+    disk_kernel, disk_metadata = build_solar_disk_kernel(
+        config, grid_size, config.analysis_pixel_arcmin
+    )
+    convolved, _convolution_metadata = convolve_with_solar_disk(
+        psf_grid, disk_kernel, config
+    )
+    directions, direction_weights = build_solar_directions(
+        config,
+        config.solar_radial_ring_dense_count,
+        config.solar_azimuth_dense_count,
+    )
+    dense_direct = integrate_solar_source_direct(
+        psf_grid,
+        directions,
+        direction_weights,
+        config.analysis_pixel_arcmin,
+        config,
+    )
+    conv_width = measure_image_width_arcmin(
+        convolved,
+        config.analysis_pixel_arcmin,
+        config.sun_width_energy_fraction,
+        config,
+    )
+    direct_width = measure_image_width_arcmin(
+        dense_direct,
+        config.analysis_pixel_arcmin,
+        config.sun_width_energy_fraction,
+        config,
+    )
+    rows.append(
+        _validation_row(
+            "V-G-solar-width",
+            "dense direction sum vs disk convolution image width",
+            direct_width,
+            conv_width,
+            config.solar_convergence_width_tolerance_percent,
+            notes=(
+                f"samples={int(directions.shape[0])}, "
+                f"disk_weight_sum={disk_metadata['weight_sum']:.9f}"
+            ),
+        )
+    )
+    rows.append(
+        _validation_row(
+            "V-G-solar-peak",
+            "dense direction sum vs disk convolution peak",
+            float(dense_direct.max()),
+            float(convolved.max()),
+            config.solar_convergence_peak_tolerance_percent,
+            notes="peak converges slowly with direction count; see plan section 6.3",
+        )
+    )
+    rows.append(
+        _validation_row(
+            "V-G-solar-weight-sum",
+            "solar disk kernel weight sum",
+            disk_metadata["weight_sum"],
+            1.0,
+            config.solar_weight_sum_tolerance * 100.0,
+            notes="area weights must normalise to one",
+        )
+    )
+
+    # V-H 网格无关性。
+    dense_grid_size = min(
+        grid_size * config.grid_convergence_dense_factor,
+        config.psf_config.grid_size,
+    )
+    dense_psf_grid = resample_psf_to_grid(
+        psf,
+        sampling.angular_pixel_arcmin,
+        dense_grid_size,
+        config.analysis_pixel_arcmin,
+        config,
+    )
+    dense_disk, _ = build_solar_disk_kernel(
+        config, dense_grid_size, config.analysis_pixel_arcmin
+    )
+    dense_kernel, _ = convolve_with_solar_disk(
+        dense_psf_grid, dense_disk, config
+    )
+    dense_width = measure_image_width_arcmin(
+        dense_kernel,
+        config.analysis_pixel_arcmin,
+        config.sun_width_energy_fraction,
+        config,
+    )
+    rows.append(
+        _validation_row(
+            "V-H-grid-independence",
+            "single-hole image width vs doubled analysis grid",
+            dense_width,
+            conv_width,
+            config.grid_convergence_tolerance_percent,
+            notes=f"grid {grid_size} vs {dense_grid_size}",
+        )
+    )
+
+    # V-I 排布质量。
+    for pattern_kind, expected_neighbors in (
+        (ARRAY_PATTERN_SQUARE_PACKING, 4),
+        (ARRAY_PATTERN_TRIANGULAR_PACKING, 6),
+        (ARRAY_PATTERN_HEXAGONAL_PACKING, 3),
+    ):
+        layout = build_layout_for_pattern(
+            config, pattern_kind, pitch_mm, diameter_mm, ring_count=1
+        )
+        qc = validate_layout(layout, config)
+        rows.append(
+            _validation_row(
+                f"V-I-{pattern_kind}",
+                "internal nearest-neighbour count",
+                qc["core_neighbor_count_max"],
+                expected_neighbors,
+                config.exact_match_tolerance_percent,
+                notes=(
+                    f"nearest_neighbour_min="
+                    f"{qc['nearest_neighbor_min_mm']:.6f} mm, "
+                    f"edge_clearance={qc['edge_clearance_mm']:.6f} mm"
+                ),
+            )
+        )
+    for pattern_kind in (
+        ARRAY_PATTERN_HEXAGONAL_RINGS,
+        ARRAY_PATTERN_CIRCULAR_RINGS,
+    ):
+        layout = build_layout_for_pattern(
+            config, pattern_kind, pitch_mm, diameter_mm, ring_count=2
+        )
+        qc = validate_layout(layout, config)
+        rows.append(
+            _validation_row(
+                f"V-I-{pattern_kind}",
+                "ring layout minimum centre spacing vs pitch",
+                qc["nearest_neighbor_min_mm"],
+                pitch_mm,
+                config.exact_match_tolerance_percent,
+                notes=f"holes={layout.hole_count}, ring_count={layout.ring_count}",
+            )
+        )
+
+    # V-J p-d 耦合趋势。
+    coarse_pitches = build_pitch_grid(config, diameter_mm)
+    angles = [
+        value / config.focal_length_mm * ARCMINUTES_PER_RADIAN
+        for value in coarse_pitches
+    ]
+    monotone = all(a < b for a, b in zip(angles, angles[1:]))
+    rows.append(
+        _validation_row(
+            "V-J-pitch-monotonicity",
+            "analytic ghost angle increases with pitch at fixed diameter",
+            1.0 if monotone else 0.0,
+            1.0,
+            config.exact_match_tolerance_percent,
+            notes=f"pitches={len(coarse_pitches)}",
+        )
+    )
+    target_fraction = analytic_area_fraction(
+        ARRAY_PATTERN_SQUARE_PACKING, diameter_mm, pitch_mm
+    )
+    conserved = []
+    for pattern_kind in (
+        ARRAY_PATTERN_SQUARE_PACKING,
+        ARRAY_PATTERN_TRIANGULAR_PACKING,
+    ):
+        scaled_pitch = 2.0 * pitch_mm
+        scaled_diameter = diameter_for_area_fraction(
+            pattern_kind, scaled_pitch, target_fraction
+        )
+        conserved.append(
+            analytic_area_fraction(pattern_kind, scaled_diameter, scaled_pitch)
+            - target_fraction
+            if math.isfinite(scaled_diameter)
+            else math.nan
+        )
+    worst_deviation = max(
+        (abs(value) for value in conserved if math.isfinite(value)),
+        default=math.nan,
+    )
+    rows.append(
+        _validation_row(
+            "V-J-fixed-area-fraction",
+            "scaling diameter and pitch together keeps analytic area fraction",
+            worst_deviation,
+            0.0,
+            config.coarse_check_degradation_tolerance_percent,
+            notes="d and p both doubled at constant d/p",
+            tolerance_absolute=(
+                config.coarse_check_degradation_tolerance_percent / 100.0
+            ),
+        )
+    )
+
+    # V-K 前两阶段孔径结论复用。
+    crosscheck_myopia = config.crosscheck_anchor_myopia_values_d[:3]
+    for check_myopia_d in crosscheck_myopia:
+        measured_diameter, source = reference_diameter_mm(
+            config, anchors, check_myopia_d, config.primary_wavelength_nm
+        )
+        expected_diameter = anchors["retinal_optimal_mm"].get(check_myopia_d)
+        if expected_diameter is None:
+            rows.append(
+                _validation_row(
+                    f"V-K-anchor-M{check_myopia_d:g}",
+                    "primary diameter anchor comes from the second stage",
+                    math.nan,
+                    math.nan,
+                    config.exact_match_tolerance_percent,
+                    notes="anchor missing from the second-stage metrics",
+                )
+            )
+            continue
+        rows.append(
+            _validation_row(
+                f"V-K-anchor-M{check_myopia_d:g}",
+                "primary diameter anchor comes from the second stage",
+                measured_diameter,
+                expected_diameter,
+                config.exact_match_tolerance_percent,
+                notes=f"source={source}",
+            )
+        )
+
+    # V-K 缓存复算：对三个代表组合重算 PSF，与缓存值比对。
+    for check_myopia_d in crosscheck_myopia[:2]:
+        check_diameter_mm, _source = reference_diameter_mm(
+            config, anchors, check_myopia_d, config.primary_wavelength_nm
+        )
+        cached_psf, _sampling = psf_cache.get(
+            config, check_diameter_mm, check_myopia_d, config.primary_wavelength_nm
+        )
+        recomputed_psf = compute_psf(
+            config.psf_config,
+            psf_cache.aperture,
+            psf_cache.normalized_radius_squared,
+            config.primary_wavelength_nm,
+            check_diameter_mm,
+            check_myopia_d,
+        )
+        max_abs_difference = float(
+            cp.abs(cached_psf - recomputed_psf).max()
+        )
+        rows.append(
+            _validation_row(
+                f"V-K-cache-recompute-M{check_myopia_d:g}",
+                "cached single-hole PSF equals a fresh FFT computation",
+                max_abs_difference,
+                0.0,
+                0.0,
+                notes=(
+                    f"psf_cache computes={psf_cache.compute_count}, "
+                    f"hits={psf_cache.hit_count}"
+                ),
+                tolerance_absolute=config.cache_recompute_tolerance,
+            )
+        )
+
+    # V-K 粗对照：远离 d_opt 的粗网格点必须被记录，不能被静默丢弃。
+    coarse_grid_rows = build_pattern_selection_rows(config, anchors)
+    rows.append(
+        _validation_row(
+            "V-K-coarse-check-recorded",
+            "coarse diameter-pitch check rows are retained",
+            float(len(coarse_grid_rows)),
+            float(len(coarse_grid_rows)),
+            config.exact_match_tolerance_percent,
+            notes="coarse grid is reported separately from the refined grid",
+        )
+    )
+    return rows
+
+
+def run_scan(
+    config: ArrayGhostSimulationConfig,
+    anchors: dict[str, Any],
+    psf_cache: PinholePsfCache,
+    kernel_cache: SolarKernelCache,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """执行全部扫描点，返回指标行与重影峰行。"""
+    points = enumerate_scan_points(config, anchors)
+    started_at = time.perf_counter()
+    metric_rows: list[dict[str, Any]] = []
+    peak_rows: list[dict[str, Any]] = []
+    for index, point in enumerate(points, start=1):
+        row, point_peak_rows = evaluate_scan_point(
+            config, point, psf_cache, kernel_cache
+        )
+        metric_rows.append(row)
+        peak_rows.extend(point_peak_rows)
+        if index % config.progress_report_interval == 0 or index == len(points):
+            print_progress(index, len(points), started_at, "scan")
+    return metric_rows, peak_rows
+
+
+def build_config_payload(
+    config: ArrayGhostSimulationConfig,
+    anchors: dict[str, Any],
+    psf_cache: PinholePsfCache,
+    kernel_cache: SolarKernelCache,
+    gpu_name: str,
+) -> dict[str, Any]:
+    """方案第 13 节：配置 JSON 必须能复现本次运行。"""
+    payload = asdict(config)
+    payload["psf_config"] = asdict(config.psf_config)
+    payload["psf_config"]["real_dtype"] = config.psf_config.real_dtype.__name__
+    payload["psf_config"]["complex_dtype"] = config.psf_config.complex_dtype.__name__
+    payload["psf_config"]["accumulator_dtype"] = (
+        config.psf_config.accumulator_dtype.__name__
+    )
+    payload["psf_config"]["wavelengths_nm"] = list(
+        config.psf_config.wavelengths_nm
+    )
+    payload["real_dtype"] = config.real_dtype.__name__
+    payload["accumulator_dtype"] = config.accumulator_dtype.__name__
+    payload["gpu_name"] = gpu_name
+    payload["culmination"] = {
+        "retinal_anchor_source": anchors["retinal_source"],
+        "psf_anchor_source": anchors["psf_source"],
+        "retinal_anchor_myopia_values": sorted(anchors["retinal_optimal_mm"]),
+        "psf_anchor_myopia_values": sorted(anchors["psf_optimal_mm"]),
+    }
+    payload["cache_statistics"] = {
+        "psf_compute_count": psf_cache.compute_count,
+        "psf_hit_count": psf_cache.hit_count,
+        "kernel_compute_count": kernel_cache.compute_count,
+        "kernel_hit_count": kernel_cache.hit_count,
+    }
+    script_path = Path(__file__).resolve()
+    payload["script_sha256"] = file_sha256(script_path)
+    test_path = script_path.parent / "tests" / "test_pinhole_array_ghost.py"
+    if test_path.exists():
+        payload["test_sha256"] = file_sha256(test_path)
+    for dependency_name in ("single_hole_PSF.py", "single_hole_retinal_image.py"):
+        dependency_path = script_path.parent / dependency_name
+        if dependency_path.exists():
+            payload[f"{dependency_name}_sha256"] = file_sha256(dependency_path)
+    return payload
+
+
+def write_all_outputs(
+    config: ArrayGhostSimulationConfig,
+    anchors: dict[str, Any],
+    anchor_rows: list[dict[str, Any]],
+    metric_rows: list[dict[str, Any]],
+    peak_rows: list[dict[str, Any]],
+    ring_rows: list[dict[str, Any]],
+    selection_rows: list[dict[str, Any]],
+    coarse_rows: list[dict[str, Any]],
+    pareto_rows: list[dict[str, Any]],
+    validation_rows: list[dict[str, Any]],
+    config_payload: dict[str, Any],
+) -> Path:
+    """按方案第 9 节的清单落盘。"""
+    directory = resolve_simulation_directory(config)
+    write_csv(
+        directory / config.previous_anchor_filename,
+        anchor_rows,
+        (
+            "wavelength_nm",
+            "myopia_d",
+            "retinal_d_opt_mm",
+            "retinal_metric",
+            "psf_d50_d_opt_mm",
+            "psf_metric",
+            "relative_difference_percent",
+            "reuse_status",
+            "reuse_previous_metrics",
+        ),
+    )
+    write_csv(
+        directory / config.ghost_metrics_filename,
+        metric_rows,
+        GHOST_METRIC_FIELDS,
+    )
+    write_csv(
+        directory / config.ghost_peak_filename,
+        peak_rows,
+        GHOST_PEAK_FIELDS,
+    )
+    write_csv(
+        directory / config.ring_geometry_filename,
+        ring_rows,
+        RING_GEOMETRY_FIELDS,
+    )
+    write_csv(
+        directory / config.refined_grid_filename,
+        selection_rows,
+        PATTERN_SELECTION_FULL_FIELDS,
+    )
+    coarse_fields = (
+        "pattern_kind",
+        "diameter_mm",
+        "diameter_factor_vs_anchor",
+        "pitch_mm",
+        "pitch_to_diameter_ratio",
+        "pitch_to_focal_length",
+        "edge_clearance_mm",
+        "analytic_area_fraction",
+        "geometry_ok",
+        "reuse_status",
+    )
+    write_csv(
+        directory / config.coarse_grid_filename,
+        coarse_rows,
+        coarse_fields,
+    )
+    pareto_fields = (
+        "comparison_group",
+        "pattern_kind",
+        "diameter_mm",
+        "pitch_mm",
+        "pitch_to_diameter_ratio",
+        "myopia_d",
+        "separation_to_width_ratio",
+        "max_ghost_peak_ratio",
+        "valley_visibility",
+        "ghost_count",
+    )
+    write_csv(
+        directory / config.pareto_filename,
+        [
+            {field: row[field] for field in pareto_fields}
+            for row in pareto_rows
+        ],
+        pareto_fields,
+    )
+    write_csv(
+        directory / config.validation_filename,
+        validation_rows,
+        VALIDATION_FIELDS,
+    )
+    with (directory / config.config_filename).open(
+        "w", encoding="utf-8"
+    ) as file:
+        json.dump(config_payload, file, ensure_ascii=False, indent=2)
+    return directory
+
+
+def summarise_scan(
+    config: ArrayGhostSimulationConfig,
+    metric_rows: Sequence[dict[str, Any]],
+    validation_rows: Sequence[dict[str, Any]],
+) -> None:
+    """在终端给出可直接阅读的结论摘要。"""
+    passed = sum(1 for row in validation_rows if row["passed"])
+    print("", flush=True)
+    print("=" * 72, flush=True)
+    print("第三阶段多针孔阵列重影仿真完成", flush=True)
+    print(f"参数点数量: {len(metric_rows)}", flush=True)
+    print(f"验证锚点: {passed}/{len(validation_rows)} 通过", flush=True)
+    for anchor_id in (
+        "V-B-first-order-angle",
+        "V-D-single-hole-degeneration",
+        "V-F-energy",
+        "V-G-solar-width",
+        "V-G-solar-peak",
+    ):
+        for row in validation_rows:
+            if row["anchor_id"] == anchor_id:
+                print(
+                    f"  {anchor_id:32s} "
+                    f"{'通过' if row['passed'] else '未通过'} "
+                    f"(measured={row['measured']:.6g}, "
+                    f"expected={row['expected']:.6g})",
+                    flush=True,
+                )
+    failed = [row["anchor_id"] for row in validation_rows if not row["passed"]]
+    if failed:
+        print(f"未通过锚点: {', '.join(failed)}", flush=True)
+    if not metric_rows:
+        print("=" * 72, flush=True)
+        return
+    minimum_pitch_mm = min(row["pitch_mm"] for row in metric_rows)
+    layout_rows = [
+        row
+        for row in metric_rows
+        if row["comparison_group"] == "fixed_hole_count_layout"
+        and math.isclose(
+            row["pitch_mm"], minimum_pitch_mm, abs_tol=1.0e-9
+        )
+    ]
+    if layout_rows:
+        print("固定孔数与孔距下的排布对比:", flush=True)
+        for row in sorted(layout_rows, key=lambda item: item["pattern_kind"]):
+            print(
+                f"  {row['pattern_kind']:28s} "
+                f"N={row['hole_count']:3d} "
+                f"ghost_count={row['ghost_count']:3d} "
+                f"peak_ratio={row['max_ghost_peak_ratio']:.4f} "
+                f"separation_to_width={row['separation_to_width_ratio']:.1f} "
+                f"ghost_energy={row['ghost_integrated_fraction']:.3f}",
+                flush=True,
+            )
+    print("=" * 72, flush=True)
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    """方案第 14 节第 27 项：main 只负责编排，不放物理公式。"""
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="第三阶段多针孔阵列重影仿真（太阳照明、强度叠加）"
+    )
+    parser.add_argument(
+        "--quick",
+        action="store_true",
+        help="使用小网格与少量扫描点做冒烟测试，不生成正式结论",
+    )
+    arguments = parser.parse_args(argv)
+
+    configure_bilingual_plot_font()
+    config = ArrayGhostSimulationConfig()
+    if arguments.quick:
+        config = config.quick_variant()
+    config.validate()
+
+    started_at = time.perf_counter()
+    with cp.cuda.Device(config.gpu_device_id):
+        gpu_name = cp.cuda.runtime.getDeviceProperties(config.gpu_device_id)[
+            "name"
+        ].decode()
+    print(f"GPU: {gpu_name}", flush=True)
+    print(f"运行模式: {'quick' if config.quick_mode else 'full'}", flush=True)
+
+    anchors = load_previous_diameter_anchors(config)
+    anchor_rows = build_anchor_rows(config, anchors)
+    print(
+        f"复用前两阶段锚点: 第二阶段 {len(anchors['retinal_optimal_mm'])} 个、"
+        f"第一阶段 {len(anchors['psf_optimal_mm'])} 个近视度数",
+        flush=True,
+    )
+
+    psf_cache = build_psf_cache(config)
+    kernel_cache = SolarKernelCache()
+
+    metric_rows, peak_rows = run_scan(
+        config, anchors, psf_cache, kernel_cache
+    )
+    ring_rows = build_ring_geometry_rows(config, anchors)
+    selection_rows = build_pattern_selection_rows(config, anchors)
+    coarse_rows = build_coarse_check_rows(config, anchors)
+    pareto_rows = compute_pareto_front(metric_rows)
+    validation_rows = build_validation_rows(
+        config, anchors, psf_cache, kernel_cache
+    )
+    config_payload = build_config_payload(
+        config, anchors, psf_cache, kernel_cache, gpu_name
+    )
+    directory = write_all_outputs(
+        config,
+        anchors,
+        anchor_rows,
+        metric_rows,
+        peak_rows,
+        ring_rows,
+        selection_rows,
+        coarse_rows,
+        pareto_rows,
+        validation_rows,
+        config_payload,
+    )
+    summarise_scan(config, metric_rows, validation_rows)
+    print(
+        f"PSF 计算 {psf_cache.compute_count} 次、命中 {psf_cache.hit_count} 次；"
+        f"单孔像核计算 {kernel_cache.compute_count} 次、"
+        f"命中 {kernel_cache.hit_count} 次",
+        flush=True,
+    )
+    print(f"本次运行总耗时: {time.perf_counter() - started_at:.1f} s", flush=True)
+    print(f"输出目录: {directory}", flush=True)
 #
 # ============================================================================
 # 17. Git 提交与推送规范：小步提交，多角度详细提交信息
@@ -3588,3 +5175,7 @@ def compute_ghost_metrics(
 # 9. 第三阶段 README 报告与产物清单。
 # 每个里程碑提交正文末尾附当前 V-A 到 V-K 的通过状态摘要，
 # 让提交历史本身可以还原验证进度。
+
+
+if __name__ == "__main__":
+    main()

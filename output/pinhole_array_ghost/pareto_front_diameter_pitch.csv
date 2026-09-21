@@ -1,0 +1,3 @@
+comparison_group,pattern_kind,diameter_mm,pitch_mm,pitch_to_diameter_ratio,myopia_d,separation_to_width_ratio,max_ghost_peak_ratio,valley_visibility,ghost_count
+diameter_pitch_grid,square_packing,0.6353883327016112,7.999999999999998,12.590725369452022,3.0,48.70720582490319,0.9998384352295814,1.0,8
+diameter_pitch_grid,triangular_packing,0.6353883327016112,7.999999999999998,12.590725369452022,3.0,48.707205824903184,0.9998099533314256,1.0,6

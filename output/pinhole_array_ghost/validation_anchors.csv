@@ -1,0 +1,27 @@
+anchor_id,description,measured,expected,relative_error_percent,tolerance_percent,tolerance_absolute,passed,notes
+V-A-square_packing,mask numeric area vs analytic circle area,0.02713173821692994,0.0,nan,1.0,1.0,True,"components=25/25, min_circularity=0.9469"
+V-A-triangular_packing,mask numeric area vs analytic circle area,0.017584424083265188,0.0,nan,1.0,1.0,True,"components=25/25, min_circularity=0.9271"
+V-A-hexagonal_packing,mask numeric area vs analytic circle area,0.008317524430763463,0.0,nan,1.0,1.0,True,"components=49/49, min_circularity=0.9397"
+V-B-first-order-angle,first-order ghost angle vs p / f,275.0197416627952,275.0197416627952,0.0,5.0,nan,True,pattern=square_packing
+V-F-energy,image total energy vs sum of hole weights,24.999999938060736,25.0,2.477570575365462e-07,0.1,nan,True,holes=25
+V-D-single-hole-degeneration,single central hole returns unit energy at field centre,1.0,1.0,0.0,0.1,nan,True,one-hole layout must equal the single-hole kernel
+V-E-two-hole-separation,symmetric two-hole pair separation vs p / f,275.0197416627952,275.0197416627952,0.0,5.0,nan,True,pair is placed symmetrically about the reference centre
+V-E-two-hole-centre-null,image at the midpoint of a symmetric pair,0.0,0.0,nan,0.0,0.001,True,midpoint value must be far below the two ghost peaks; peak=0.000478304
+V-C-incoherent-sum,two identical holes show no periodic interference modulation,0.00021488691525130626,0.0,nan,0.0,0.001,True,mirror symmetry holds for intensity summation only
+V-G-solar-width,dense direction sum vs disk convolution image width,22.45499156826594,22.454202554544267,0.0035138799507812824,2.0,nan,True,"samples=18432, disk_weight_sum=1.000000011"
+V-G-solar-peak,dense direction sum vs disk convolution peak,7.732762605883181e-05,7.712522346992046e-05,0.26243371468517485,2.0,nan,True,peak converges slowly with direction count; see plan section 6.3
+V-G-solar-weight-sum,solar disk kernel weight sum,1.0000000113977876,1.0,1.1397787602618337e-06,9.999999999999999e-05,nan,True,area weights must normalise to one
+V-H-grid-independence,single-hole image width vs doubled analysis grid,22.585548647685478,22.454202554544267,0.5849510479036326,2.0,nan,True,grid 256 vs 512
+V-I-square_packing,internal nearest-neighbour count,4,4,0.0,1e-06,nan,True,"nearest_neighbour_min=2.000000 mm, edge_clearance=1.364612 mm"
+V-I-triangular_packing,internal nearest-neighbour count,6,6,0.0,1e-06,nan,True,"nearest_neighbour_min=2.000000 mm, edge_clearance=1.364612 mm"
+V-I-hexagonal_packing,internal nearest-neighbour count,3,3,0.0,1e-06,nan,True,"nearest_neighbour_min=2.000000 mm, edge_clearance=1.364612 mm"
+V-I-concentric_hexagonal_rings,ring layout minimum centre spacing vs pitch,2.0,2.0,0.0,1e-06,nan,True,"holes=19, ring_count=2"
+V-I-concentric_circular_rings,ring layout minimum centre spacing vs pitch,2.0,2.0,0.0,1e-06,nan,True,"holes=61, ring_count=4"
+V-J-pitch-monotonicity,analytic ghost angle increases with pitch at fixed diameter,1.0,1.0,0.0,1e-06,nan,True,pitches=9
+V-J-fixed-area-fraction,scaling diameter and pitch together keeps analytic area fraction,0.0,0.0,nan,5.0,0.05,True,d and p both doubled at constant d/p
+V-K-anchor-M1,primary diameter anchor comes from the second stage,1.1005248747756682,1.1005248747756682,0.0,1e-06,nan,True,source=retinal_optotype_primary
+V-K-anchor-M2,primary diameter anchor comes from the second stage,0.7781886018183509,0.7781886018183509,0.0,1e-06,nan,True,source=retinal_optotype_primary
+V-K-anchor-M3,primary diameter anchor comes from the second stage,0.6353883327016112,0.6353883327016112,0.0,1e-06,nan,True,source=retinal_optotype_primary
+V-K-cache-recompute-M1,cached single-hole PSF equals a fresh FFT computation,0.0,0.0,nan,0.0,1e-06,True,"psf_cache computes=10, hits=1"
+V-K-cache-recompute-M2,cached single-hole PSF equals a fresh FFT computation,0.0,0.0,nan,0.0,1e-06,True,"psf_cache computes=11, hits=1"
+V-K-coarse-check-recorded,coarse diameter-pitch check rows are retained,27.0,27.0,0.0,1e-06,nan,True,coarse grid is reported separately from the refined grid

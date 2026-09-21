@@ -5,6 +5,7 @@
 """
 
 import math
+import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
@@ -24,6 +25,9 @@ from pinhole_array_ghost import (
     cluster_ghost_positions,
     classify_risk_labels,
     compute_ghost_metrics,
+    compute_pareto_front,
+    enumerate_scan_points,
+    evaluate_scan_point,
     local_peak_arcmin,
     convolve_with_solar_disk,
     integrate_solar_source_direct,
@@ -36,6 +40,10 @@ from pinhole_array_ghost import (
     ARRAY_PATTERN_SQUARE_PACKING,
     ARRAY_PATTERN_TRIANGULAR_PACKING,
     ArrayGhostSimulationConfig,
+    GHOST_METRIC_FIELDS,
+    GHOST_PEAK_FIELDS,
+    SolarKernelCache,
+    _validation_row,
     analytic_area_fraction,
     build_pitch_grid,
     generate_circular_rings,
@@ -48,6 +56,7 @@ from pinhole_array_ghost import (
     minimum_ring_radius_mm,
     rasterize_mask,
     resolve_simulation_directory,
+    write_csv,
     validate_config,
     validate_layout,
     validate_mask,
@@ -1443,6 +1452,143 @@ class PitchGridTest(unittest.TestCase):
         # 上界不得低于下界，否则对数采样会出现非法区间。
         self.assertGreaterEqual(values[-1], values[0])
         self.assertGreaterEqual(values[0], 2.2 - 1e-12)
+
+
+class ScanOrchestrationTest(unittest.TestCase):
+    """第 8 节的分层扫描与 CSV 契约。"""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.config = ArrayGhostSimulationConfig().quick_variant()
+        cls.anchors = load_previous_diameter_anchors(cls.config)
+        cls.points = enumerate_scan_points(cls.config, cls.anchors)
+
+    def test_quick_scan_covers_all_comparison_groups(self) -> None:
+        groups = {point.comparison_group for point in self.points}
+
+        self.assertIn("fixed_hole_count_layout", groups)
+        self.assertIn("fixed_area_fraction_layout", groups)
+        self.assertIn("ring_growth", groups)
+        self.assertIn("design_point_A", groups)
+        self.assertIn("pupil_study_A", groups)
+        self.assertIn("diameter_pitch_grid", groups)
+        self.assertNotIn("wavelength_study", groups)
+
+    def test_quick_scan_points_respect_geometry_clearance(self) -> None:
+        for point in self.points:
+            with self.subTest(
+                group=point.comparison_group,
+                pattern=point.layout.pattern_kind,
+                pitch=point.pitch_mm,
+                diameter=point.diameter_mm,
+            ):
+                self.assertGreaterEqual(
+                    point.pitch_mm - point.diameter_mm,
+                    self.config.minimum_edge_clearance_mm - 1.0e-12,
+                )
+                self.assertTrue(
+                    validate_layout(point.layout, self.config)["geometry_ok"]
+                )
+
+    def test_metric_and_peak_rows_match_csv_contracts(self) -> None:
+        psf_cache = build_psf_cache(self.config)
+        kernel_cache = SolarKernelCache()
+        row, peak_rows = evaluate_scan_point(
+            self.config, self.points[0], psf_cache, kernel_cache
+        )
+
+        self.assertLessEqual(set(row), set(GHOST_METRIC_FIELDS))
+        for peak_row in peak_rows:
+            self.assertLessEqual(set(peak_row), set(GHOST_PEAK_FIELDS))
+
+
+class ParetoFrontTest(unittest.TestCase):
+    def _row(
+        self,
+        *,
+        separation: float,
+        peak_ratio: float,
+        valley: float,
+        group: str = "diameter_pitch_grid",
+        geometry_ok: bool = True,
+    ) -> dict[str, Any]:
+        return {
+            "comparison_group": group,
+            "geometry_ok": geometry_ok,
+            "separation_to_width_ratio": separation,
+            "max_ghost_peak_ratio": peak_ratio,
+            "valley_visibility": valley,
+        }
+
+    def test_dominated_and_invalid_candidates_are_removed(self) -> None:
+        dominated = self._row(separation=2.0, peak_ratio=0.8, valley=0.2)
+        dominant = self._row(separation=3.0, peak_ratio=0.5, valley=0.4)
+        invalid = self._row(
+            separation=8.0, peak_ratio=0.1, valley=0.9, geometry_ok=False
+        )
+        wrong_group = self._row(
+            separation=8.0, peak_ratio=0.1, valley=0.9, group="ring_growth"
+        )
+
+        front = compute_pareto_front(
+            [dominated, dominant, invalid, wrong_group]
+        )
+
+        self.assertEqual(front, [dominant])
+
+    def test_tradeoff_candidates_remain_on_front(self) -> None:
+        balanced = self._row(separation=3.0, peak_ratio=0.5, valley=0.4)
+        separated = self._row(separation=5.0, peak_ratio=0.9, valley=0.7)
+
+        front = compute_pareto_front([balanced, separated])
+
+        self.assertCountEqual(front, [balanced, separated])
+
+
+class ValidationAndOutputContractTest(unittest.TestCase):
+    def test_nonzero_expected_value_uses_relative_tolerance(self) -> None:
+        row = _validation_row(
+            "example",
+            "relative tolerance",
+            measured=101.0,
+            expected=100.0,
+            tolerance_percent=2.0,
+        )
+
+        self.assertTrue(row["passed"])
+        self.assertAlmostEqual(row["relative_error_percent"], 1.0, places=12)
+
+    def test_zero_expected_value_requires_absolute_tolerance(self) -> None:
+        without_absolute = _validation_row(
+            "zero",
+            "zero expected without absolute tolerance",
+            measured=0.0,
+            expected=0.0,
+            tolerance_percent=1.0,
+        )
+        with_absolute = _validation_row(
+            "zero",
+            "zero expected with absolute tolerance",
+            measured=0.0,
+            expected=0.0,
+            tolerance_percent=1.0,
+            tolerance_absolute=1.0e-9,
+        )
+
+        self.assertFalse(without_absolute["passed"])
+        self.assertTrue(with_absolute["passed"])
+
+    def test_write_csv_keeps_declared_column_order(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "rows.csv"
+            write_csv(
+                path,
+                [{"second": 2, "first": 1}],
+                ("first", "second"),
+            )
+            lines = path.read_text(encoding="utf-8").splitlines()
+
+        self.assertEqual(lines, ["first,second", "1,2"])
 
 
 class LayoutQualityTest(unittest.TestCase):
