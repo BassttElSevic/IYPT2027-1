@@ -19,6 +19,7 @@ from pinhole_array_ghost import (
     build_diameter_anchor_grid,
     build_geometry_rows,
     build_psf_cache,
+    build_retinal_optotype_scene,
     build_solar_convergence_rows,
     build_solar_directions,
     build_solar_disk_kernel,
@@ -29,13 +30,18 @@ from pinhole_array_ghost import (
     compute_ghost_metrics,
     compute_pareto_front,
     configure_bilingual_plot_font,
+    defocus_first_order_angle_arcmin,
+    defocus_geometric_blur_arcmin,
+    defocus_hole_shifts_arcmin,
     enumerate_scan_points,
     evaluate_scan_point,
     local_peak_arcmin,
     convolve_with_solar_disk,
+    convolve_retinal_scene_with_array_psf,
     integrate_solar_source_direct,
     load_previous_diameter_anchors,
     measure_image_width_arcmin,
+    minimum_nonzero_shift_distance_arcmin,
     plan_field_grid,
     resample_psf_to_grid,
 )
@@ -46,6 +52,8 @@ from pinhole_array_ghost import (
     GHOST_METRIC_FIELDS,
     GHOST_PEAK_FIELDS,
     SolarKernelCache,
+    _retinal_scene_ghost_stats,
+    _row_with_pupil_vignetting,
     _validation_row,
     analytic_area_fraction,
     build_pitch_grid,
@@ -244,13 +252,192 @@ class FieldOfViewTest(unittest.TestCase):
             math.isclose(config.solar_angular_radius_arcmin, 15.9, abs_tol=0.05)
         )
 
-    def test_first_order_angle_matches_pitch_over_focal_length(self) -> None:
+    def test_first_order_angle_matches_defocus_times_pitch(self) -> None:
         config = ArrayGhostSimulationConfig()
         pitch_mm = 2.0
-        expected_deg = math.degrees(pitch_mm / config.focal_length_mm)
+        myopia_d = 3.0
+        expected_degree = math.degrees(
+            myopia_d * pitch_mm / 1000.0
+        )
+        measured_arcmin = defocus_first_order_angle_arcmin(
+            pitch_mm,
+            myopia_d,
+        )
 
-        # p / f 的一阶重影角口径：2 mm / 25 mm = 0.08 rad = 4.5837 度。
-        self.assertAlmostEqual(expected_deg, 4.5837, places=3)
+        # M p 的一阶重影角口径：3 D × 2 mm = 0.006 rad = 20.6265 arcmin。
+        self.assertAlmostEqual(expected_degree, 0.343775, places=6)
+        self.assertAlmostEqual(measured_arcmin, 20.6265, places=3)
+
+    def test_defocus_shift_is_zero_when_eye_is_in_focus(self) -> None:
+        centers_mm = np.asarray([[-1.0, 0.0], [1.0, 0.0]])
+
+        shifts = defocus_hole_shifts_arcmin(centers_mm, 0.0)
+
+        np.testing.assert_allclose(shifts, np.zeros_like(centers_mm))
+
+    def test_defocus_shift_grows_linearly_with_myopia_and_pitch(self) -> None:
+        one_mm = np.asarray([[1.0, 0.0]])
+
+        at_three_d = abs(float(defocus_hole_shifts_arcmin(one_mm, 3.0)[0, 0]))
+        at_six_d = abs(float(defocus_hole_shifts_arcmin(one_mm, 6.0)[0, 0]))
+        at_two_mm = defocus_first_order_angle_arcmin(2.0, 3.0)
+        at_four_mm = defocus_first_order_angle_arcmin(4.0, 3.0)
+
+        self.assertAlmostEqual(at_six_d, 2.0 * at_three_d, places=9)
+        self.assertAlmostEqual(at_four_mm, 2.0 * at_two_mm, places=9)
+
+    def test_minimum_shift_uses_geometry_when_ghost_images_overlap(self) -> None:
+        shifts = np.asarray([[0.0, 0.0], [4.0, 0.0], [0.0, 4.0]])
+        weights = np.ones(3)
+
+        measured = minimum_nonzero_shift_distance_arcmin(
+            shifts,
+            weights,
+            tolerance=1.0e-9,
+        )
+
+        self.assertAlmostEqual(measured, 4.0, places=12)
+
+    def test_geometric_blur_is_defocus_times_diameter(self) -> None:
+        measured = defocus_geometric_blur_arcmin(0.9, 3.0)
+
+        self.assertAlmostEqual(
+            measured,
+            0.9 * 3.0 * 1.0e-3 * (180.0 * 60.0 / math.pi),
+            places=9,
+        )
+
+
+class RetinalOptotypeSceneTest(unittest.TestCase):
+    def test_e_scene_reuses_second_stage_geometry_on_field_grid(self) -> None:
+        config = replace(
+            ArrayGhostSimulationConfig(),
+            retinal_scene_stroke_arcmin=4.0,
+            retinal_scene_antialias_fraction=0.75,
+        )
+        field = {
+            "grid_size": 128,
+            "pixel_arcmin": 0.5,
+            "half_width_arcmin": 32.0,
+        }
+
+        scene, metadata = build_retinal_optotype_scene(field, config)
+
+        self.assertEqual(scene.shape, (128, 128))
+        self.assertAlmostEqual(float(scene.max()), 1.0, places=6)
+        self.assertAlmostEqual(float(scene[64, 64]), 1.0, places=6)
+        self.assertAlmostEqual(float(scene[0, 0]), 0.0, places=6)
+        numeric_area_arcmin2 = metadata["total_energy"] * (0.5**2)
+        expected_area_arcmin2 = 17.0 * 4.0**2
+        self.assertAlmostEqual(
+            numeric_area_arcmin2,
+            expected_area_arcmin2,
+            delta=1.0,
+        )
+
+    def test_retinal_convolution_preserves_center_and_energy(self) -> None:
+        config = ArrayGhostSimulationConfig()
+        scene = cp.zeros((64, 64), dtype=cp.float32)
+        array_psf = cp.zeros((64, 64), dtype=cp.float32)
+        scene[32, 32] = 2.0
+        array_psf[32, 32] = 0.5
+        array_psf[32, 40] = 0.25
+        array_psf[24, 32] = 0.25
+
+        retinal, metadata = convolve_retinal_scene_with_array_psf(
+            scene,
+            array_psf,
+            config,
+        )
+
+        cp.testing.assert_allclose(
+            retinal,
+            2.0 * array_psf,
+            rtol=1.0e-5,
+            atol=1.0e-6,
+        )
+        self.assertAlmostEqual(
+            metadata["retinal_total_energy"],
+            metadata["expected_total_energy"],
+            places=5,
+        )
+        self.assertAlmostEqual(metadata["peak"], 1.0, places=5)
+
+    def test_finite_pupil_selects_only_ghost_holes_it_can_accept(self) -> None:
+        config = ArrayGhostSimulationConfig()
+        layout = generate_square_packing(config, 2.0, 0.635388)
+        vignetted_row = _row_with_pupil_vignetting(
+            {"pupil_diameter_mm": 8.0, "myopia_d": 3.0},
+            4.0,
+        )
+
+        stats = _retinal_scene_ghost_stats(
+            config,
+            vignetted_row,
+            layout,
+        )
+
+        self.assertEqual(int(stats["active_hole_count"]), 5)
+        self.assertAlmostEqual(stats["ghost_peak_ratio"], 0.483135, places=5)
+        self.assertAlmostEqual(
+            stats["ghost_energy_fraction"],
+            0.659143,
+            places=3,
+        )
+        self.assertAlmostEqual(
+            stats["ghost_angle_arcmin"],
+            20.6265,
+            places=3,
+        )
+        expected_optotype_width_arcmin = (
+            config.retinal_scene_optotype_width_factor
+            * config.retinal_scene_stroke_arcmin
+        )
+        expected_shift_fraction = (
+            stats["ghost_angle_arcmin"] / expected_optotype_width_arcmin
+        )
+        self.assertAlmostEqual(
+            stats["ghost_shift_fraction"],
+            expected_shift_fraction,
+            places=9,
+        )
+        self.assertAlmostEqual(
+            stats["ghost_overlap_fraction"],
+            1.0 - expected_shift_fraction,
+            places=9,
+        )
+        self.assertAlmostEqual(
+            stats["single_hole_blur_arcmin"],
+            defocus_geometric_blur_arcmin(0.635388, 3.0),
+            places=9,
+        )
+
+        no_ghost_row = _row_with_pupil_vignetting(
+            {"pupil_diameter_mm": 8.0, "myopia_d": 3.0},
+            2.0,
+        )
+        no_ghost_stats = _retinal_scene_ghost_stats(
+            config,
+            no_ghost_row,
+            layout,
+        )
+        self.assertEqual(int(no_ghost_stats["active_hole_count"]), 1)
+        self.assertEqual(no_ghost_stats["ghost_peak_ratio"], 0.0)
+        self.assertEqual(no_ghost_stats["ghost_energy_fraction"], 0.0)
+        self.assertEqual(no_ghost_stats["ghost_shift_fraction"], 0.0)
+        self.assertEqual(no_ghost_stats["ghost_overlap_fraction"], 0.0)
+
+        focused_row = _row_with_pupil_vignetting(
+            {"pupil_diameter_mm": 8.0, "myopia_d": 0.0},
+            4.0,
+        )
+        focused_stats = _retinal_scene_ghost_stats(
+            config,
+            focused_row,
+            layout,
+        )
+        self.assertEqual(focused_stats["ghost_angle_arcmin"], 0.0)
+        self.assertEqual(focused_stats["ghost_energy_fraction"], 0.0)
 
 
 def neighbor_angles_deg(centers: Any, center_index: int, radius_mm: float) -> list[float]:
@@ -623,9 +810,7 @@ class ArrayImageTest(unittest.TestCase):
 
     def _shifts(self, centers_mm):
         return cp.asarray(
-            centers_mm
-            / self.config.focal_length_mm
-            * (180.0 * 60.0 / math.pi),
+            defocus_hole_shifts_arcmin(centers_mm, 3.0),
             dtype=cp.float32,
         )
 
@@ -749,14 +934,15 @@ class ArrayImageTest(unittest.TestCase):
         )
         self.assertAlmostEqual(result["total_energy"], 2.0, places=6)
 
-    def test_shift_places_peak_at_pitch_over_focal_length(self) -> None:
+    def test_shift_places_peak_at_defocus_times_half_pitch(self) -> None:
         import numpy as np
 
         pitch_mm = 2.0
         centers_mm = np.array([[-0.5 * pitch_mm, 0.0]], dtype=np.float64)
         shifts = self._shifts(centers_mm)
-        expected_arcmin = (
-            pitch_mm / self.config.focal_length_mm * (180.0 * 60.0 / math.pi) * 0.5
+        expected_arcmin = defocus_first_order_angle_arcmin(
+            0.5 * pitch_mm,
+            3.0,
         )
         self.assertAlmostEqual(
             abs(float(shifts[0, 0])),
@@ -971,14 +1157,13 @@ class GhostMetricsTest(unittest.TestCase):
             cls.config,
         )
         cls.theory_angle_arcmin = (
-            2.0 / cls.config.focal_length_mm * (180.0 * 60.0 / math.pi)
+            defocus_first_order_angle_arcmin(2.0, 3.0)
         )
 
     def _metrics_for(self, layout, pitch_mm: float):
-        shifts_np = (
-            layout.centers_mm
-            / self.config.focal_length_mm
-            * (180.0 * 60.0 / math.pi)
+        shifts_np = defocus_hole_shifts_arcmin(
+            layout.centers_mm,
+            3.0,
         )
         weights_np, _ = compute_hole_weights(layout, None, self.config)
         shifts = cp.asarray(shifts_np, dtype=cp.float32)
@@ -1007,13 +1192,13 @@ class GhostMetricsTest(unittest.TestCase):
         for pattern in ("square", "triangular", "honeycomb"):
             with self.subTest(pattern=pattern):
                 if pattern == "square":
-                    layout = generate_square_packing(self.config, 2.0, 0.6354)
+                    layout = generate_square_packing(self.config, 4.0, 0.6354)
                 elif pattern == "triangular":
-                    layout = generate_triangular_packing(self.config, 2.0, 0.6354)
+                    layout = generate_triangular_packing(self.config, 4.0, 0.6354)
                 else:
-                    layout = generate_hexagonal_packing(self.config, 2.0, 0.6354)
+                    layout = generate_hexagonal_packing(self.config, 4.0, 0.6354)
                 _metrics, rows, _clusters, _result, _field = self._metrics_for(
-                    layout, 2.0
+                    layout, 4.0
                 )
 
                 ratios = [row["peak_ratio"] for row in rows]
@@ -1031,7 +1216,7 @@ class GhostMetricsTest(unittest.TestCase):
             places=2,
         )
 
-    def test_first_order_angle_matches_pitch_over_focal_length(self) -> None:
+    def test_first_order_angle_matches_defocus_times_pitch(self) -> None:
         layout = generate_square_packing(self.config, 2.0, 0.6354)
         metrics, _rows, _clusters, _result, _field = self._metrics_for(layout, 2.0)
 
@@ -1051,18 +1236,17 @@ class GhostMetricsTest(unittest.TestCase):
 
         self.assertEqual(metrics["ghost_cluster_count"], layout.hole_count - 1)
 
-    def test_well_separated_ghosts_report_unit_valley_visibility(self) -> None:
+    def test_first_order_ghosts_overlap_at_three_diopters(self) -> None:
         layout = generate_square_packing(self.config, 2.0, 0.6354)
         metrics, _rows, _clusters, _result, _field = self._metrics_for(layout, 2.0)
 
-        self.assertGreater(
+        self.assertLess(
             metrics["separation_to_width_ratio"],
             self.config.separation_ratio_threshold,
         )
-        self.assertEqual(metrics["valley_visibility"], 1.0)
-        self.assertEqual(
-            metrics["valley_status"], "not_evaluated_well_separated"
-        )
+        self.assertTrue(math.isfinite(metrics["valley_visibility"]))
+        self.assertGreaterEqual(metrics["valley_visibility"], 0.0)
+        self.assertLessEqual(metrics["valley_visibility"], 1.0)
 
     def test_energy_is_conserved_in_metric_row(self) -> None:
         layout = generate_circular_rings(self.config, 2.0, 0.6354)
@@ -1511,7 +1695,7 @@ class ScanOrchestrationTest(unittest.TestCase):
         anchors = load_previous_diameter_anchors(config)
         points = enumerate_scan_points(config, anchors)
 
-        self.assertEqual(len(points), 881)
+        self.assertEqual(len(points), 889)
         wavelength_points = [
             point
             for point in points
@@ -1680,7 +1864,7 @@ class ValidationAndOutputContractTest(unittest.TestCase):
                         "pattern_kind": pattern_kind,
                         "diameter_mm": 0.6354,
                         "pitch_mm": pitch_mm,
-                        "first_order_angle_arcmin": 275.0 * index,
+                        "first_order_angle_arcmin": 20.0 * index,
                         "separation_to_width_ratio": 12.0 * index,
                     }
                 )
