@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import cupy as cp
+import numpy as np
 
 from pinhole_array_ghost import (
     accumulate_shifted_kernels,
@@ -20,6 +21,10 @@ from pinhole_array_ghost import (
     build_solar_disk_kernel,
     circle_overlap_area_mm2,
     compute_hole_weights,
+    cluster_ghost_positions,
+    classify_risk_labels,
+    compute_ghost_metrics,
+    local_peak_arcmin,
     convolve_with_solar_disk,
     integrate_solar_source_direct,
     load_previous_diameter_anchors,
@@ -836,6 +841,315 @@ def m_reference(config, anchors):
     from pinhole_array_ghost import reference_diameter_mm
 
     return reference_diameter_mm(config, anchors, 3.0, 550.0)
+
+
+class SubPixelPeakTest(unittest.TestCase):
+    def test_parabolic_refinement_recovers_sub_pixel_peak(self) -> None:
+        config = ArrayGhostSimulationConfig()
+        grid_size = 64
+        pixel_arcmin = 0.1
+        axis = (cp.arange(grid_size, dtype=cp.float32) - grid_size // 2) * pixel_arcmin
+        grid_x, grid_y = cp.meshgrid(axis, axis, indexing="xy")
+        # 峰值偏离像素中心约 0.3 与 -0.2 个像素。
+        offset_x = 0.3 * pixel_arcmin
+        offset_y = -0.2 * pixel_arcmin
+        sigma = 5.0 * pixel_arcmin
+        image = cp.exp(
+            -((grid_x - offset_x) ** 2 + (grid_y - offset_y) ** 2) / (2.0 * sigma**2)
+        )
+
+        measured = local_peak_arcmin(
+            image,
+            pixel_arcmin,
+            np.asarray([offset_x, offset_y]),
+            8.0 * pixel_arcmin,
+        )
+        raw_peak = float(image.max())
+
+        self.assertAlmostEqual(measured, 1.0, places=3)
+        self.assertLess(abs(measured - 1.0), abs(raw_peak - 1.0) + 1e-6)
+
+    def test_peak_search_is_local_not_global(self) -> None:
+        config = ArrayGhostSimulationConfig()
+        grid_size = 64
+        pixel_arcmin = 0.5
+        image = cp.zeros((grid_size, grid_size), dtype=cp.float32)
+        image[grid_size // 2 + 4, grid_size // 2 + 4] = 0.25
+        image[grid_size // 2, grid_size // 2] = 0.75
+
+        near_centre = local_peak_arcmin(
+            image, pixel_arcmin, np.zeros(2), pixel_arcmin
+        )
+        self.assertAlmostEqual(near_centre, 0.75, places=6)
+
+
+class GhostClusteringTest(unittest.TestCase):
+    def test_holes_farther_than_merge_radius_stay_separate(self) -> None:
+        shifts = np.asarray([[0.0, 0.0], [10.0, 0.0], [0.0, 10.0]])
+        weights = np.ones(3)
+        clusters = cluster_ghost_positions(shifts, weights, 2.0)
+
+        self.assertEqual(len(clusters), 3)
+        for cluster in clusters:
+            self.assertEqual(cluster["multiplicity"], 1)
+
+    def test_holes_inside_merge_radius_merge_into_one_cluster(self) -> None:
+        shifts = np.asarray([[10.0, 0.0], [10.5, 0.0], [10.25, 0.2]])
+        weights = np.ones(3)
+        clusters = cluster_ghost_positions(shifts, weights, 1.0)
+
+        self.assertEqual(len(clusters), 1)
+        self.assertEqual(clusters[0]["multiplicity"], 3)
+        self.assertAlmostEqual(clusters[0]["total_weight"], 3.0, places=12)
+
+    def test_cluster_centre_is_weighted_average(self) -> None:
+        shifts = np.asarray([[0.0, 0.0], [1.0, 0.0]])
+        weights = np.asarray([1.0, 3.0])
+        clusters = cluster_ghost_positions(shifts, weights, 2.0)
+
+        self.assertEqual(len(clusters), 1)
+        self.assertAlmostEqual(clusters[0]["centre_arcmin"][0], 0.75, places=12)
+
+    def test_clusters_are_sorted_by_radius(self) -> None:
+        shifts = np.asarray([[0.0, 0.0], [5.0, 0.0], [2.0, 0.0]])
+        weights = np.ones(3)
+        clusters = cluster_ghost_positions(shifts, weights, 0.5)
+
+        radii = [cluster["radius_arcmin"] for cluster in clusters]
+        self.assertEqual(radii, sorted(radii))
+
+
+class GhostMetricsTest(unittest.TestCase):
+    """V-B、V-E、V-F：等亮重影、重影能量占比与解析角间隔。"""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.config = ArrayGhostSimulationConfig().quick_variant()
+        cls.cache = build_psf_cache(cls.config)
+        psf, sampling = cls.cache.get(cls.config, 0.6354, 3.0, 550.0)
+        grid_size = cls.config.effective_analysis_grid_size()
+        psf_grid = resample_psf_to_grid(
+            psf,
+            sampling.angular_pixel_arcmin,
+            grid_size,
+            cls.config.analysis_pixel_arcmin,
+            cls.config,
+        )
+        disk, _ = build_solar_disk_kernel(
+            cls.config, grid_size, cls.config.analysis_pixel_arcmin
+        )
+        cls.kernel, _ = convolve_with_solar_disk(psf_grid, disk, cls.config)
+        cls.width_arcmin = measure_image_width_arcmin(
+            cls.kernel,
+            cls.config.analysis_pixel_arcmin,
+            cls.config.sun_width_energy_fraction,
+            cls.config,
+        )
+        cls.theory_angle_arcmin = (
+            2.0 / cls.config.focal_length_mm * (180.0 * 60.0 / math.pi)
+        )
+
+    def _metrics_for(self, layout, pitch_mm: float):
+        shifts_np = (
+            layout.centers_mm
+            / self.config.focal_length_mm
+            * (180.0 * 60.0 / math.pi)
+        )
+        weights_np, _ = compute_hole_weights(layout, None, self.config)
+        shifts = cp.asarray(shifts_np, dtype=cp.float32)
+        weights = cp.asarray(weights_np, dtype=self.config.accumulator_dtype)
+        field = plan_field_grid(shifts, self.width_arcmin, self.config)
+        result = accumulate_shifted_kernels(
+            self.kernel,
+            self.config.analysis_pixel_arcmin,
+            shifts,
+            weights,
+            field,
+            self.config,
+        )
+        metrics, rows, clusters = compute_ghost_metrics(
+            result,
+            field,
+            shifts_np,
+            weights_np,
+            self.width_arcmin,
+            self.theory_angle_arcmin,
+            self.config,
+        )
+        return metrics, rows, clusters, result, field
+
+    def test_every_ghost_is_as_bright_as_the_main_image(self) -> None:
+        for pattern in ("square", "triangular", "honeycomb"):
+            with self.subTest(pattern=pattern):
+                if pattern == "square":
+                    layout = generate_square_packing(self.config, 2.0, 0.6354)
+                elif pattern == "triangular":
+                    layout = generate_triangular_packing(self.config, 2.0, 0.6354)
+                else:
+                    layout = generate_hexagonal_packing(self.config, 2.0, 0.6354)
+                _metrics, rows, _clusters, _result, _field = self._metrics_for(
+                    layout, 2.0
+                )
+
+                ratios = [row["peak_ratio"] for row in rows]
+                self.assertGreater(len(ratios), 0)
+                self.assertLess(max(abs(value - 1.0) for value in ratios), 0.01)
+
+    def test_ghost_energy_fraction_is_one_minus_one_over_hole_count(self) -> None:
+        layout = generate_square_packing(self.config, 2.0, 0.6354)
+        metrics, _rows, _clusters, _result, _field = self._metrics_for(layout, 2.0)
+        expected = (layout.hole_count - 1) / layout.hole_count
+
+        self.assertAlmostEqual(
+            metrics["ghost_integrated_fraction"],
+            expected,
+            places=2,
+        )
+
+    def test_first_order_angle_matches_pitch_over_focal_length(self) -> None:
+        layout = generate_square_packing(self.config, 2.0, 0.6354)
+        metrics, _rows, _clusters, _result, _field = self._metrics_for(layout, 2.0)
+
+        self.assertLess(
+            metrics["first_order_angle_error_percent"],
+            self.config.first_order_angle_tolerance_percent,
+        )
+        self.assertAlmostEqual(
+            metrics["first_order_angle_arcmin"],
+            self.theory_angle_arcmin,
+            places=3,
+        )
+
+    def test_cluster_count_equals_holes_minus_main(self) -> None:
+        layout = generate_triangular_packing(self.config, 2.0, 0.6354)
+        metrics, _rows, _clusters, _result, _field = self._metrics_for(layout, 2.0)
+
+        self.assertEqual(metrics["ghost_cluster_count"], layout.hole_count - 1)
+
+    def test_well_separated_ghosts_report_unit_valley_visibility(self) -> None:
+        layout = generate_square_packing(self.config, 2.0, 0.6354)
+        metrics, _rows, _clusters, _result, _field = self._metrics_for(layout, 2.0)
+
+        self.assertGreater(
+            metrics["separation_to_width_ratio"],
+            self.config.separation_ratio_threshold,
+        )
+        self.assertEqual(metrics["valley_visibility"], 1.0)
+        self.assertEqual(
+            metrics["valley_status"], "not_evaluated_well_separated"
+        )
+
+    def test_energy_is_conserved_in_metric_row(self) -> None:
+        layout = generate_circular_rings(self.config, 2.0, 0.6354)
+        metrics, _rows, _clusters, _result, _field = self._metrics_for(layout, 2.0)
+
+        self.assertLess(
+            metrics["energy_relative_error_percent"],
+            self.config.energy_relative_tolerance_percent,
+        )
+
+    def test_direction_anisotropy_distinguishes_honeycomb_from_rings(self) -> None:
+        honeycomb = generate_hexagonal_packing(self.config, 2.0, 0.6354)
+        rings = generate_circular_rings(self.config, 2.0, 0.6354)
+        honeycomb_metrics, _r1, _c1, _i1, _f1 = self._metrics_for(honeycomb, 2.0)
+        ring_metrics, _r2, _c2, _i2, _f2 = self._metrics_for(rings, 2.0)
+
+        # 蜂窝只有 3 个近邻方向，方位各向异性必须高于环形阵列。
+        self.assertGreater(
+            honeycomb_metrics["direction_anisotropy"],
+            ring_metrics["direction_anisotropy"],
+        )
+
+    def test_metrics_include_pattern_signature_and_positions(self) -> None:
+        layout = generate_square_packing(self.config, 2.0, 0.6354)
+        metrics, _rows, _clusters, _result, _field = self._metrics_for(layout, 2.0)
+
+        self.assertGreater(len(metrics["pattern_signature"]), 0)
+        self.assertGreater(len(metrics["ghost_positions"]), 0)
+        self.assertEqual(metrics["ghost_count"], layout.hole_count - 1)
+
+
+class RiskLabelTest(unittest.TestCase):
+    def _base_metrics(self) -> dict[str, Any]:
+        return {
+            "separation_to_width_ratio": 10.0,
+            "max_ghost_peak_ratio": 1.0,
+        }
+
+    def _base_layout_qc(self, pitch_mm: float = 1.0) -> dict[str, Any]:
+        return {
+            "geometry_ok": True,
+            "topology_ok": True,
+            "pitch_nominal_mm": pitch_mm,
+        }
+
+    def test_well_separated_bright_ghosts_are_resolved(self) -> None:
+        config = ArrayGhostSimulationConfig()
+        primary, labels = classify_risk_labels(
+            self._base_layout_qc(),
+            self._base_metrics(),
+            2.0,
+            1.0,
+            config,
+        )
+
+        self.assertEqual(primary, "GhostResolved")
+        self.assertIn("GhostResolved", labels)
+
+    def test_small_separation_ratio_is_merged(self) -> None:
+        config = ArrayGhostSimulationConfig()
+        metrics = self._base_metrics()
+        metrics["separation_to_width_ratio"] = 0.5
+        primary, labels = classify_risk_labels(
+            self._base_layout_qc(), metrics, 2.0, 1.0, config
+        )
+
+        self.assertEqual(primary, "GhostMerged")
+
+    def test_faint_ghosts_are_weak(self) -> None:
+        config = ArrayGhostSimulationConfig()
+        metrics = self._base_metrics()
+        metrics["max_ghost_peak_ratio"] = 0.001
+        primary, labels = classify_risk_labels(
+            self._base_layout_qc(), metrics, 2.0, 1.0, config
+        )
+
+        self.assertEqual(primary, "GhostWeak")
+
+    def test_invalid_geometry_dominates_other_labels(self) -> None:
+        config = ArrayGhostSimulationConfig()
+        layout_qc = self._base_layout_qc()
+        layout_qc["geometry_ok"] = False
+        primary, labels = classify_risk_labels(
+            layout_qc, self._base_metrics(), 2.0, 1.0, config
+        )
+
+        self.assertEqual(primary, "InvalidGeometry")
+        self.assertIn("InvalidGeometry", labels)
+
+    def test_pitch_at_or_above_pupil_flags_dead_zone(self) -> None:
+        config = ArrayGhostSimulationConfig()
+        primary, labels = classify_risk_labels(
+            self._base_layout_qc(pitch_mm=4.0),
+            self._base_metrics(),
+            4.0,
+            1.0,
+            config,
+        )
+
+        self.assertIn("DeadZoneRisk", labels)
+
+    def test_vignetted_reference_hole_is_flagged(self) -> None:
+        config = ArrayGhostSimulationConfig()
+        primary, labels = classify_risk_labels(
+            self._base_layout_qc(),
+            self._base_metrics(),
+            2.0,
+            0.1,
+            config,
+        )
+
+        self.assertEqual(primary, "PupilVignetted")
 
 
 class SquarePackingTest(unittest.TestCase):

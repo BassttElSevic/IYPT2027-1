@@ -1125,8 +1125,11 @@ class ArrayGhostSimulationConfig:
     valley_profile_sample_count: int = 512
     sun_width_energy_fraction: float = 0.50
     direction_histogram_bin_count: int = 36
+    autocorrelation_min_lag_arcmin: float = 1.0
+    autocorrelation_max_lag_arcmin: float = 120.0
     main_window_radius_factor: float = 1.0
     core_neighbor_radius_factor: float = 1.05
+    pupil_reference_weight_threshold: float = 0.5
 
     # -------------------------------------------------------- 验证判据
     mask_area_relative_tolerance: float = 0.01
@@ -1356,6 +1359,13 @@ def validate_config(config: ArrayGhostSimulationConfig) -> None:
             "field_min_pixels_per_image_width must be at least 2 so that a "
             "single-hole image is not collapsed into one pixel"
         )
+    if config.autocorrelation_max_lag_arcmin <= config.autocorrelation_min_lag_arcmin:
+        raise ValueError(
+            "autocorrelation_max_lag_arcmin must exceed "
+            "autocorrelation_min_lag_arcmin"
+        )
+    if not 0.0 <= config.pupil_reference_weight_threshold <= 1.0:
+        raise ValueError("pupil_reference_weight_threshold must lie in [0, 1]")
     if config.quick_mode and config.reuse_previous_metrics is False:
         # quick 模式也必须在正式结论中复用前两阶段锚点。
         raise ValueError("quick mode still requires reuse_previous_metrics")
@@ -3038,6 +3048,484 @@ def accumulate_shifted_kernels(
         "pixel_arcmin": field_pixel_arcmin,
         "grid_size": field_size,
     }
+
+
+# ============================================================================
+# 实现部分 5/5：重影指标、风险标签与规则性
+# ============================================================================
+
+
+def cluster_ghost_positions(
+    shifts_arcmin: np.ndarray,
+    weights: np.ndarray,
+    merge_radius_arcmin: float,
+) -> list[dict[str, Any]]:
+    """把落在同一个像宽内的孔心位移合并成一个重影簇。
+
+    合并半径取 merge_radius_factor * W（W 为太阳盘卷积后的像宽）。
+    为了不引入位置偏差，簇心取成员位移的加权平均，而不是取某个孔。
+    """
+    if shifts_arcmin.shape[0] == 0:
+        return []
+    radius = max(merge_radius_arcmin, 1.0e-9)
+    tree = cKDTree(shifts_arcmin)
+    remaining = set(range(shifts_arcmin.shape[0]))
+    clusters: list[dict[str, Any]] = []
+    while remaining:
+        seed = remaining.pop()
+        members = {seed}
+        frontier = [seed]
+        while frontier:
+            current = frontier.pop()
+            for neighbour in tree.query_ball_point(shifts_arcmin[current], radius):
+                if neighbour in remaining:
+                    remaining.discard(neighbour)
+                    members.add(neighbour)
+                    frontier.append(neighbour)
+        member_indices = sorted(members)
+        member_shifts = shifts_arcmin[member_indices]
+        member_weights = weights[member_indices]
+        weight_sum = float(member_weights.sum())
+        if weight_sum > 0.0:
+            centre = (
+                member_shifts * member_weights[:, None]
+            ).sum(axis=0) / weight_sum
+        else:
+            centre = member_shifts.mean(axis=0)
+        clusters.append(
+            {
+                "centre_arcmin": centre,
+                "member_indices": member_indices,
+                "multiplicity": len(member_indices),
+                "total_weight": weight_sum,
+                "radius_arcmin": float(
+                    math.hypot(float(centre[0]), float(centre[1]))
+                ),
+            }
+        )
+    clusters.sort(key=lambda cluster: cluster["radius_arcmin"])
+    return clusters
+
+
+def local_peak_arcmin(
+    image: Any,
+    field_pixel_arcmin: float,
+    centre_arcmin: np.ndarray,
+    half_width_arcmin: float,
+) -> float:
+    """取指定角位置附近的峰值，并做抛物线亚像素修正。
+
+    踩坑提示：直接取离散最大值会因亚像素落点产生可达 ±25% 的峰高抖动，
+    足以把'等亮重影'误判成'亮度不同的重影'。这里在离散峰周围做二维
+    抛物线拟合，修正到真实峰顶。
+    """
+    grid_size = int(image.shape[0])
+    centre_index = grid_size // 2
+    centre_x = int(round(centre_index + float(centre_arcmin[0]) / field_pixel_arcmin))
+    centre_y = int(round(centre_index + float(centre_arcmin[1]) / field_pixel_arcmin))
+    half_width_px = max(1, int(math.ceil(half_width_arcmin / field_pixel_arcmin)))
+    x_start = max(0, centre_x - half_width_px)
+    x_stop = min(grid_size, centre_x + half_width_px + 1)
+    y_start = max(0, centre_y - half_width_px)
+    y_stop = min(grid_size, centre_y + half_width_px + 1)
+    if x_stop <= x_start or y_stop <= y_start:
+        return 0.0
+    window = image[y_start:y_stop, x_start:x_stop]
+    if window.size == 0:
+        return 0.0
+    peak_index = int(cp.argmax(window).item())
+    peak_y, peak_x = divmod(peak_index, int(window.shape[1]))
+    peak_value = float(window[peak_y, peak_x])
+    # 只有峰不在局部窗口边界时才能做抛物线修正。
+    if (
+        0 < peak_y < int(window.shape[0]) - 1
+        and 0 < peak_x < int(window.shape[1]) - 1
+    ):
+        left = float(window[peak_y, peak_x - 1])
+        right = float(window[peak_y, peak_x + 1])
+        down = float(window[peak_y - 1, peak_x])
+        up = float(window[peak_y + 1, peak_x])
+        curvature_x = left - 2.0 * peak_value + right
+        curvature_y = down - 2.0 * peak_value + up
+        if curvature_x < 0.0:
+            # 抛物线顶点修正：delta = -(right-left)^2 / (8 * curvature)。
+            peak_value -= 0.125 * (left - right) ** 2 / curvature_x
+        if curvature_y < 0.0:
+            peak_value -= 0.125 * (down - up) ** 2 / curvature_y
+    return peak_value
+
+
+def extract_ghost_peaks(
+    image: Any,
+    field: dict[str, Any],
+    clusters: Sequence[dict[str, Any]],
+    main_peak: float,
+    image_width_arcmin: float,
+    config: ArrayGhostSimulationConfig,
+) -> list[dict[str, Any]]:
+    """每个重影簇一行：位置、重数、权重、实测峰与峰比。"""
+    rows: list[dict[str, Any]] = []
+    search_half_width_arcmin = max(
+        config.merge_radius_factor * image_width_arcmin,
+        field["pixel_arcmin"],
+    )
+    for index, cluster in enumerate(clusters):
+        if cluster["radius_arcmin"] <= config.floating_comparison_tolerance:
+            continue
+        centre = cluster["centre_arcmin"]
+        peak = local_peak_arcmin(
+            image,
+            field["pixel_arcmin"],
+            centre,
+            search_half_width_arcmin,
+        )
+        rows.append(
+            {
+                "ghost_index": index,
+                "ghost_x_arcmin": float(centre[0]),
+                "ghost_y_arcmin": float(centre[1]),
+                "ghost_radius_arcmin": cluster["radius_arcmin"],
+                "ghost_azimuth_deg": math.degrees(
+                    math.atan2(float(centre[1]), float(centre[0]))
+                )
+                % 360.0,
+                "multiplicity": cluster["multiplicity"],
+                "total_weight": cluster["total_weight"],
+                "measured_peak": peak,
+                "peak_ratio": (
+                    peak / main_peak if main_peak > 0.0 else math.nan
+                ),
+                "above_visibility_threshold": (
+                    peak / main_peak >= config.visibility_peak_threshold
+                    if main_peak > 0.0
+                    else False
+                ),
+            }
+        )
+    return rows
+
+
+def valley_visibility_between_peaks(
+    image: Any,
+    field_pixel_arcmin: float,
+    first_center_arcmin: np.ndarray,
+    second_center_arcmin: np.ndarray,
+    config: ArrayGhostSimulationConfig,
+) -> tuple[float, str]:
+    """方案 7.2 节：两峰之间谷值的可见度。
+
+        visibility = (I_low - I_valley) / (I_low + I_valley)
+    完全分离时趋向 1，完全融合时趋向 0。
+    """
+    separation_arcmin = float(
+        math.hypot(
+            float(second_center_arcmin[0] - first_center_arcmin[0]),
+            float(second_center_arcmin[1] - first_center_arcmin[1]),
+        )
+    )
+    if separation_arcmin > config.valley_numeric_max_separation_arcmin:
+        return 1.0, "not_evaluated_well_separated"
+    sample_count = config.valley_profile_sample_count
+    fractions = cp.linspace(0.0, 1.0, sample_count, dtype=cp.float32)
+    x_arcmin = (
+        float(first_center_arcmin[0])
+        + fractions * float(second_center_arcmin[0] - first_center_arcmin[0])
+    )
+    y_arcmin = (
+        float(first_center_arcmin[1])
+        + fractions * float(second_center_arcmin[1] - first_center_arcmin[1])
+    )
+    grid_size = int(image.shape[0])
+    centre_index = grid_size // 2
+    sample_y = cp.asarray(y_arcmin) / field_pixel_arcmin + centre_index
+    sample_x = cp.asarray(x_arcmin) / field_pixel_arcmin + centre_index
+    profile = map_coordinates(
+        image,
+        cp.stack((sample_y, sample_x), axis=0),
+        order=config.psf_resampling_order,
+        mode="constant",
+        cval=0.0,
+    )
+    # 峰之间只比较内部区段，避免把峰本身当成谷值。
+    interior_start = max(1, int(0.15 * sample_count))
+    interior_stop = min(sample_count - 1, int(0.85 * sample_count))
+    if interior_stop <= interior_start:
+        return math.nan, "profile_too_short"
+    interior = profile[interior_start:interior_stop]
+    peak_values = cp.array(
+        [float(profile[0]), float(profile[-1])], dtype=config.real_dtype
+    )
+    lower_peak = float(peak_values.min())
+    valley = float(interior.min())
+    if lower_peak + valley <= 0.0:
+        return math.nan, "zero_signal"
+    return (lower_peak - valley) / (lower_peak + valley), "numeric"
+
+
+def compute_image_autocorrelation_metrics(
+    image: Any,
+    field_pixel_arcmin: float,
+    config: ArrayGhostSimulationConfig,
+) -> dict[str, Any]:
+    """方案 7.3 节：用自相关旁瓣衡量阵列的规则性。
+
+    规则晶格会产生强旁瓣，随机排布更平滑。这里取中心以外、给定
+    滞后半径内的最大旁瓣与中位背景之比。
+    """
+    grid_size = int(image.shape[0])
+    centered = image - image.mean()
+    spectrum = cp.fft.fft2(centered)
+    autocorrelation = cp.fft.fftshift(
+        cp.real(cp.fft.ifft2(spectrum * cp.conj(spectrum)))
+    )
+    centre_index = grid_size // 2
+    peak = float(autocorrelation[centre_index, centre_index])
+    if peak <= 0.0:
+        return {
+            "autocorrelation_peak_to_median": math.nan,
+            "autocorrelation_max_offcentre_radius_arcmin": math.nan,
+        }
+    coordinate = cp.arange(grid_size, dtype=cp.float32) - centre_index
+    grid_x, grid_y = cp.meshgrid(coordinate, coordinate, indexing="xy")
+    radius_px = cp.sqrt(grid_x * grid_x + grid_y * grid_y)
+    min_lag_px = config.autocorrelation_min_lag_arcmin / field_pixel_arcmin
+    max_lag_px = config.autocorrelation_max_lag_arcmin / field_pixel_arcmin
+    ring_mask = (radius_px >= min_lag_px) & (radius_px <= max_lag_px)
+    if not bool(ring_mask.any()):
+        return {
+            "autocorrelation_peak_to_median": math.nan,
+            "autocorrelation_max_offcentre_radius_arcmin": math.nan,
+        }
+    ring_values = autocorrelation[ring_mask]
+    median = float(cp.median(ring_values))
+    ring_normalised = ring_values / peak
+    max_index = int(cp.argmax(ring_normalised).item())
+    max_value = float(ring_normalised[max_index])
+    ring_radii_px = radius_px[ring_mask]
+    max_radius_px = float(ring_radii_px[max_index])
+    return {
+        "autocorrelation_peak_to_median": (
+            max_value / (median / peak) if median > 0.0 else math.nan
+        ),
+        "autocorrelation_max_offcentre_value": max_value,
+        "autocorrelation_max_offcentre_radius_arcmin": (
+            max_radius_px * field_pixel_arcmin
+        ),
+    }
+
+
+def ghost_direction_histogram(
+    ghost_rows: Sequence[dict[str, Any]],
+    config: ArrayGhostSimulationConfig,
+) -> dict[str, Any]:
+    """方案 7.3 节：重影方位角直方图，用于区分各向异性排布。"""
+    bin_count = config.direction_histogram_bin_count
+    counts = np.zeros(bin_count, dtype=np.float64)
+    for row in ghost_rows:
+        if not row["above_visibility_threshold"]:
+            continue
+        index = int(row["ghost_azimuth_deg"] / 360.0 * bin_count) % bin_count
+        counts[index] += 1.0
+    total = counts.sum()
+    fractions = counts / total if total > 0.0 else counts
+    nonzero = counts[counts > 0.0]
+    anisotropy = (
+        float(nonzero.max() / nonzero.mean()) if nonzero.size > 0 else math.nan
+    )
+    return {
+        "direction_histogram": "|".join(f"{value:.6f}" for value in fractions),
+        "direction_anisotropy": anisotropy,
+        "direction_occupied_bin_count": int((counts > 0.0).sum()),
+    }
+
+
+def classify_risk_labels(
+    layout_qc: dict[str, Any],
+    metrics: dict[str, Any],
+    pupil_diameter_mm: float,
+    reference_weight: float,
+    config: ArrayGhostSimulationConfig,
+) -> tuple[str, str]:
+    """方案 7.4 节：每个参数点至少一个离散风险标签。"""
+    labels: list[str] = []
+    if not layout_qc["geometry_ok"] or not layout_qc["topology_ok"]:
+        labels.append(RISK_INVALID_GEOMETRY)
+    if layout_qc["pitch_nominal_mm"] >= pupil_diameter_mm:
+        # 经典 Scheiner 条件：孔距不小于瞳孔直径时，瞳孔内最多一个孔，
+        # 视线落在孔间就没有主像，形成死区。
+        labels.append(RISK_DEAD_ZONE)
+    if reference_weight < config.pupil_reference_weight_threshold:
+        labels.append(RISK_PUPIL_VIGNETTED)
+    if metrics["separation_to_width_ratio"] < config.separation_ratio_threshold:
+        labels.append(RISK_GHOST_MERGED)
+    if metrics["max_ghost_peak_ratio"] < config.ghost_peak_ratio_threshold:
+        labels.append(RISK_GHOST_WEAK)
+    if (
+        metrics["separation_to_width_ratio"] >= config.separation_ratio_threshold
+        and metrics["max_ghost_peak_ratio"] >= config.ghost_peak_ratio_threshold
+    ):
+        labels.append(RISK_GHOST_RESOLVED)
+    if not labels:
+        labels.append(RISK_GHOST_WEAK)
+
+    # 主标签的优先级：几何非法 > 参考孔被挡 > 重影融合 > 死区 > 重影可分辨。
+    # 死区排在'可分辨'之前，是因为孔距不小于瞳孔直径时瞳孔内最多只有一个
+    # 孔，参数点即使重影分得很开，也会在视线落在孔间时丢失主像。
+    if RISK_INVALID_GEOMETRY in labels:
+        primary = RISK_INVALID_GEOMETRY
+    elif RISK_PUPIL_VIGNETTED in labels:
+        primary = RISK_PUPIL_VIGNETTED
+    elif RISK_GHOST_MERGED in labels:
+        primary = RISK_GHOST_MERGED
+    elif RISK_DEAD_ZONE in labels:
+        primary = RISK_DEAD_ZONE
+    elif RISK_GHOST_RESOLVED in labels:
+        primary = RISK_GHOST_RESOLVED
+    else:
+        primary = RISK_GHOST_WEAK
+    return primary, "|".join(labels)
+
+
+def compute_ghost_metrics(
+    image_result: dict[str, Any],
+    field: dict[str, Any],
+    shifts_arcmin: np.ndarray,
+    weights: np.ndarray,
+    image_width_arcmin: float,
+    theory_first_order_angle_arcmin: float,
+    config: ArrayGhostSimulationConfig,
+) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
+    """方案第 7 节的最小指标集合。"""
+    image = image_result["image"]
+    main_peak = local_peak_arcmin(
+        image,
+        field["pixel_arcmin"],
+        np.zeros(2, dtype=np.float64),
+        max(
+            config.main_window_radius_factor * image_width_arcmin,
+            field["pixel_arcmin"],
+        ),
+    )
+    merge_radius_arcmin = max(
+        config.merge_radius_factor * image_width_arcmin,
+        field["pixel_arcmin"],
+    )
+    clusters = cluster_ghost_positions(shifts_arcmin, weights, merge_radius_arcmin)
+    ghost_rows = extract_ghost_peaks(
+        image,
+        field,
+        clusters,
+        main_peak,
+        image_width_arcmin,
+        config,
+    )
+    visible_rows = [
+        row for row in ghost_rows if row["above_visibility_threshold"]
+    ]
+
+    first_order_angle_arcmin = (
+        min((row["ghost_radius_arcmin"] for row in ghost_rows), default=math.nan)
+    )
+    max_peak_ratio = max(
+        (row["peak_ratio"] for row in ghost_rows), default=0.0
+    )
+    separation_to_width_ratio = (
+        first_order_angle_arcmin / image_width_arcmin
+        if image_width_arcmin > 0.0 and math.isfinite(first_order_angle_arcmin)
+        else math.nan
+    )
+
+    # 主像窗口外的能量占比。
+    grid_size = int(image.shape[0])
+    centre_index = grid_size // 2
+    coordinate = cp.arange(grid_size, dtype=cp.float32) - centre_index
+    grid_x, grid_y = cp.meshgrid(coordinate, coordinate, indexing="xy")
+    window_radius_px = (
+        config.main_window_radius_factor * image_width_arcmin / field["pixel_arcmin"]
+    )
+    outside_mask = cp.sqrt(grid_x**2 + grid_y**2) > window_radius_px
+    total_energy = float(image.sum(dtype=config.accumulator_dtype))
+    outside_energy = float(image[outside_mask].sum(dtype=config.accumulator_dtype))
+    ghost_integrated_fraction = (
+        outside_energy / total_energy if total_energy > 0.0 else math.nan
+    )
+
+    visible_ghosts = [
+        row for row in ghost_rows if row["above_visibility_threshold"]
+    ]
+    if visible_ghosts:
+        nearest = min(
+            visible_ghosts, key=lambda row: row["ghost_radius_arcmin"]
+        )
+        valley_visibility, valley_status = valley_visibility_between_peaks(
+            image,
+            field["pixel_arcmin"],
+            np.zeros(2, dtype=np.float64),
+            np.array(
+                [nearest["ghost_x_arcmin"], nearest["ghost_y_arcmin"]],
+                dtype=np.float64,
+            ),
+            config,
+        )
+    else:
+        valley_visibility = math.nan
+        valley_status = "no_visible_ghost"
+
+    autocorrelation = compute_image_autocorrelation_metrics(
+        image, field["pixel_arcmin"], config
+    )
+    direction = ghost_direction_histogram(ghost_rows, config)
+    multiplicity_values = [row["multiplicity"] for row in ghost_rows]
+    pattern_signature = "|".join(
+        f"{row['ghost_azimuth_deg']:.3f}@{row['peak_ratio']:.4f}"
+        for row in visible_rows
+    )
+
+    metrics = {
+        "ghost_count": len(visible_rows),
+        "ghost_cluster_count": len(ghost_rows),
+        "unique_overlap_count": sum(
+            1 for value in multiplicity_values if value > 1
+        ),
+        "max_ghost_multiplicity": max(multiplicity_values, default=0),
+        "first_order_angle_arcmin": first_order_angle_arcmin,
+        "theory_first_order_angle_arcmin": theory_first_order_angle_arcmin,
+        "first_order_angle_error_percent": (
+            100.0
+            * abs(first_order_angle_arcmin - theory_first_order_angle_arcmin)
+            / theory_first_order_angle_arcmin
+            if theory_first_order_angle_arcmin > 0.0
+            and math.isfinite(first_order_angle_arcmin)
+            else math.nan
+        ),
+        "max_ghost_peak_ratio": max_peak_ratio,
+        "ghost_integrated_fraction": ghost_integrated_fraction,
+        "sun_image_width_arcmin": image_width_arcmin,
+        "separation_to_width_ratio": separation_to_width_ratio,
+        "valley_visibility": valley_visibility,
+        "valley_status": valley_status,
+        "main_peak": main_peak,
+        "image_total_energy": total_energy,
+        "energy_relative_error_percent": (
+            100.0
+            * abs(total_energy - image_result["expected_energy"])
+            / image_result["expected_energy"]
+            if image_result["expected_energy"] > 0.0
+            else math.nan
+        ),
+        "field_grid_size": field["grid_size"],
+        "field_pixel_arcmin": field["pixel_arcmin"],
+        "field_pixels_per_image_width": field["pixels_per_image_width"],
+        "field_grid_coarsened": field["coarsened"],
+        "ghost_positions": "|".join(
+            f"{row['ghost_x_arcmin']:.3f}:{row['ghost_y_arcmin']:.3f}"
+            for row in visible_rows
+        ),
+        "pattern_signature": pattern_signature,
+    }
+    metrics.update(autocorrelation)
+    metrics.update(direction)
+    return metrics, ghost_rows, clusters
 #
 # ============================================================================
 # 17. Git 提交与推送规范：小步提交，多角度详细提交信息
