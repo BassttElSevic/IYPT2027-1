@@ -252,6 +252,7 @@
   "solar_azimuth_sample_count": 64,
   "solar_radial_ring_dense_count": 96,
   "solar_azimuth_dense_count": 192,
+  "solar_convergence_grid_size": 256,
   "solar_weight_sum_tolerance": 1e-06,
   "solar_convergence_peak_tolerance_percent": 2.0,
   "solar_convergence_width_tolerance_percent": 2.0,
@@ -343,7 +344,7 @@
     18.0
   ],
   "validation_figure_size_inches": [
-    24.0,
+    36.0,
     14.0
   ],
   "suptitle_font_size": 17.0,
@@ -354,6 +355,18 @@
   "tick_font_size": 8.0,
   "conclusion_font_size": 11.0,
   "table_font_size": 9.0,
+  "validation_table_character_limit": 52,
+  "validation_table_notes_wrap_characters": 72,
+  "validation_table_column_widths": [
+    0.075,
+    0.125,
+    0.075,
+    0.075,
+    0.07,
+    0.07,
+    0.065,
+    0.445
+  ],
   "image_log_dynamic_range": 3.0,
   "image_colormap_name": "inferno",
   "pattern_colormap_name": "viridis",
@@ -365,6 +378,11 @@
   "pattern_schematic_diameter_mm": 0.7,
   "pattern_schematic_ring_count": 3,
   "pattern_schematic_half_extent_mm": 9.0,
+  "slice_selection_tolerance_fraction": 0.03,
+  "scatter_marker_alpha": 0.82,
+  "figure_tight_layout_h_pad": 2.5,
+  "figure_tight_layout_w_pad": 2.0,
+  "heatmap_singleton_extent_fraction": 0.05,
   "output_root_directory_name": "output",
   "simulation_directory_name": "pinhole_array_ghost",
   "config_filename": "array_ghost_config.json",
@@ -388,7 +406,7 @@
   "slice_figure_filename": "pitch_diameter_slices.png",
   "design_figure_filename": "design_comparison.png",
   "validation_figure_filename": "validation_table.png",
-  "run_mode": "quick",
+  "run_mode": "full",
   "progress_report_interval": 10,
   "quick_row_count": 5,
   "quick_column_count": 5,
@@ -444,13 +462,13 @@
     ]
   },
   "cache_statistics": {
-    "psf_compute_count": 11,
-    "psf_hit_count": 1,
-    "kernel_compute_count": 9,
-    "kernel_hit_count": 63
+    "psf_compute_count": 50,
+    "psf_hit_count": 4,
+    "kernel_compute_count": 50,
+    "kernel_hit_count": 832
   },
-  "script_sha256": "30762e3949407ca83dc3f2574f5377d171723e8974a35a4122885e0af8a9e45f",
-  "test_sha256": "8958bedd1374a2afb68e47704b01c07ac3efb593aae4694b3b913c574195ded5",
+  "script_sha256": "0368f3e7383306fd51baf51de0cb68e8e92ee3a01a7be6ae1cbe340d193494a3",
+  "test_sha256": "8ea9f58b95b70403eadaa4dab1633d93f4a69a1c19473a94f92a7d2ed4ea74cb",
   "single_hole_PSF.py_sha256": "dd784e45ab6862c16ad31d7a17d266ad96b3f6de61392e0c11eefb355fad88a3",
   "single_hole_retinal_image.py_sha256": "48aad6d2e131836f1e91115eec43117f53d4dc6b4048f885ee46d65286f786c2"
 }

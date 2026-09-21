@@ -909,7 +909,9 @@ import csv
 import hashlib
 import json
 import math
+import textwrap
 import time
+from collections import Counter
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Iterable, Sequence
@@ -920,6 +922,7 @@ import numpy as np
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.colors import LogNorm
 
 from scipy.spatial import cKDTree
 from cupyx.scipy.ndimage import map_coordinates
@@ -964,6 +967,14 @@ ARRAY_PATTERN_OPTIONAL_KINDS: tuple[str, ...] = (
     ARRAY_PATTERN_JITTERED_SQUARE,
     ARRAY_PATTERN_POISSON_DISK,
 )
+
+PATTERN_DISPLAY_NAMES: dict[str, str] = {
+    ARRAY_PATTERN_SQUARE_PACKING: "正方形密铺 / Square",
+    ARRAY_PATTERN_TRIANGULAR_PACKING: "三角形密铺 / Triangular",
+    ARRAY_PATTERN_HEXAGONAL_PACKING: "蜂窝六边形 / Honeycomb",
+    ARRAY_PATTERN_HEXAGONAL_RINGS: "六边形同心环 / Hex rings",
+    ARRAY_PATTERN_CIRCULAR_RINGS: "圆形同心环 / Circular rings",
+}
 
 # 光源与风险标签的字符串契约。
 SOURCE_KIND_POINT = "point"
@@ -1086,6 +1097,7 @@ class ArrayGhostSimulationConfig:
     solar_azimuth_sample_count: int = 64
     solar_radial_ring_dense_count: int = 96
     solar_azimuth_dense_count: int = 192
+    solar_convergence_grid_size: int = 256
     solar_weight_sum_tolerance: float = 1.0e-6
     solar_convergence_peak_tolerance_percent: float = 2.0
     solar_convergence_width_tolerance_percent: float = 2.0
@@ -1157,7 +1169,7 @@ class ArrayGhostSimulationConfig:
     diameter_pitch_figure_size_inches: tuple[float, float] = (30.0, 22.0)
     slice_figure_size_inches: tuple[float, float] = (28.0, 18.0)
     design_figure_size_inches: tuple[float, float] = (28.0, 18.0)
-    validation_figure_size_inches: tuple[float, float] = (24.0, 14.0)
+    validation_figure_size_inches: tuple[float, float] = (36.0, 14.0)
     suptitle_font_size: float = 17.0
     axis_title_font_size: float = 12.0
     axis_label_font_size: float = 11.0
@@ -1166,6 +1178,18 @@ class ArrayGhostSimulationConfig:
     tick_font_size: float = 8.0
     conclusion_font_size: float = 11.0
     table_font_size: float = 9.0
+    validation_table_character_limit: int = 52
+    validation_table_notes_wrap_characters: int = 72
+    validation_table_column_widths: tuple[float, ...] = (
+        0.075,
+        0.125,
+        0.075,
+        0.075,
+        0.070,
+        0.070,
+        0.065,
+        0.445,
+    )
     image_log_dynamic_range: float = 3.0
     image_colormap_name: str = "inferno"
     pattern_colormap_name: str = "viridis"
@@ -1177,6 +1201,11 @@ class ArrayGhostSimulationConfig:
     pattern_schematic_diameter_mm: float = 0.7
     pattern_schematic_ring_count: int = 3
     pattern_schematic_half_extent_mm: float = 9.0
+    slice_selection_tolerance_fraction: float = 0.03
+    scatter_marker_alpha: float = 0.82
+    figure_tight_layout_h_pad: float = 2.5
+    figure_tight_layout_w_pad: float = 2.0
+    heatmap_singleton_extent_fraction: float = 0.05
 
     # ------------------------------------------------------- 输出与命名
     output_root_directory_name: str = "output"
@@ -1334,6 +1363,14 @@ def validate_config(config: ArrayGhostSimulationConfig) -> None:
         "sun_width_energy_fraction": config.sun_width_energy_fraction,
         "field_min_pixels_per_image_width": config.field_min_pixels_per_image_width,
         "figure_dpi": float(config.figure_dpi),
+        "slice_selection_tolerance_fraction": (
+            config.slice_selection_tolerance_fraction
+        ),
+        "figure_tight_layout_h_pad": config.figure_tight_layout_h_pad,
+        "figure_tight_layout_w_pad": config.figure_tight_layout_w_pad,
+        "heatmap_singleton_extent_fraction": (
+            config.heatmap_singleton_extent_fraction
+        ),
     }
     for name, value in positive_scalars.items():
         if not math.isfinite(value) or value <= 0.0:
@@ -1353,6 +1390,28 @@ def validate_config(config: ArrayGhostSimulationConfig) -> None:
         )
     if config.visibility_peak_threshold <= 0.0:
         raise ValueError("visibility_peak_threshold must be positive")
+    if not 0.0 < config.scatter_marker_alpha <= 1.0:
+        raise ValueError("scatter_marker_alpha must lie in (0, 1]")
+    if config.validation_table_character_limit < 8:
+        raise ValueError("validation_table_character_limit must be at least 8")
+    if config.validation_table_notes_wrap_characters < 8:
+        raise ValueError(
+            "validation_table_notes_wrap_characters must be at least 8"
+        )
+    if (
+        len(config.validation_table_column_widths) != 8
+        or any(width <= 0.0 for width in config.validation_table_column_widths)
+        or not math.isclose(
+            sum(config.validation_table_column_widths),
+            1.0,
+            rel_tol=1.0e-9,
+            abs_tol=1.0e-9,
+        )
+    ):
+        raise ValueError(
+            "validation_table_column_widths must contain eight positive "
+            "fractions summing to one"
+        )
     for name in (
         "solar_convergence_peak_tolerance_percent",
         "solar_convergence_width_tolerance_percent",
@@ -1397,6 +1456,7 @@ def validate_config(config: ArrayGhostSimulationConfig) -> None:
         "solar_azimuth_sample_count": config.solar_azimuth_sample_count,
         "solar_radial_ring_dense_count": config.solar_radial_ring_dense_count,
         "solar_azimuth_dense_count": config.solar_azimuth_dense_count,
+        "solar_convergence_grid_size": config.solar_convergence_grid_size,
         "direction_histogram_bin_count": config.direction_histogram_bin_count,
         "valley_profile_sample_count": config.valley_profile_sample_count,
         "aperture_anti_alias_subsamples": config.aperture_anti_alias_subsamples,
@@ -2370,6 +2430,18 @@ def _optimal_diameter_from_rows(
     return best_diameter, best_metric
 
 
+def _lookup_float_key(
+    mapping: dict[float, Any],
+    key: float,
+    absolute_tolerance: float = 1.0e-6,
+) -> Any | None:
+    """按浮点容差查找 CSV 解析出的波长或近视度数键。"""
+    for candidate, value in mapping.items():
+        if math.isclose(candidate, key, abs_tol=absolute_tolerance):
+            return value
+    return None
+
+
 def load_previous_diameter_anchors(
     config: ArrayGhostSimulationConfig,
 ) -> dict[str, Any]:
@@ -2386,6 +2458,12 @@ def load_previous_diameter_anchors(
         )
     )
 
+    requested_wavelengths = tuple(
+        dict.fromkeys(
+            (config.reference_anchor_wavelength_nm,)
+            + tuple(config.spectral_wavelengths_nm)
+        )
+    )
     anchors: dict[str, Any] = {
         "retinal_source": str(config.retinal_metrics_relative_path),
         "psf_source": str(
@@ -2394,23 +2472,40 @@ def load_previous_diameter_anchors(
             )
         ),
         "retinal_optimal_mm": {},
+        "retinal_optimal_mm_by_wavelength": {},
         "retinal_metric": {},
+        "retinal_metric_by_wavelength": {},
         "psf_optimal_mm": {},
+        "psf_optimal_mm_by_wavelength": {},
         "psf_metric": {},
+        "psf_metric_by_wavelength": {},
+        "psf_source_by_wavelength": {},
     }
 
     if retinal_path.exists():
         rows = _read_metric_rows(retinal_path)
-        diameters, metrics = _optimal_diameter_from_rows(
-            rows,
-            config.retinal_wavelength_column,
-            config.retinal_myopia_column,
-            config.retinal_diameter_column,
-            config.retinal_threshold_column,
-            config.reference_anchor_wavelength_nm,
-        )
-        anchors["retinal_optimal_mm"] = diameters
-        anchors["retinal_metric"] = metrics
+        for wavelength_nm in requested_wavelengths:
+            diameters, metrics = _optimal_diameter_from_rows(
+                rows,
+                config.retinal_wavelength_column,
+                config.retinal_myopia_column,
+                config.retinal_diameter_column,
+                config.retinal_threshold_column,
+                wavelength_nm,
+            )
+            if not diameters:
+                continue
+            anchors["retinal_optimal_mm_by_wavelength"][wavelength_nm] = (
+                diameters
+            )
+            anchors["retinal_metric_by_wavelength"][wavelength_nm] = metrics
+            if math.isclose(
+                wavelength_nm,
+                config.reference_anchor_wavelength_nm,
+                abs_tol=1.0e-6,
+            ):
+                anchors["retinal_optimal_mm"] = diameters
+                anchors["retinal_metric"] = metrics
         anchors["retinal_row_count"] = len(rows)
     elif config.reuse_previous_metrics:
         raise FileNotFoundError(
@@ -2418,19 +2513,41 @@ def load_previous_diameter_anchors(
             f"{retinal_path}"
         )
 
-    if psf_path.exists():
-        rows = _read_metric_rows(psf_path)
+    psf_row_count = 0
+    for wavelength_nm in requested_wavelengths:
+        wavelength_path = repository_root / (
+            config.psf_metrics_relative_path_template.format(
+                wavelength_nm=wavelength_nm
+            )
+        )
+        if not wavelength_path.exists():
+            continue
+        rows = _read_metric_rows(wavelength_path)
         diameters, metrics = _optimal_diameter_from_rows(
             rows,
             config.psf_wavelength_column,
             config.psf_myopia_column,
             config.psf_diameter_column,
             config.psf_metric_column,
-            config.reference_anchor_wavelength_nm,
+            wavelength_nm,
         )
-        anchors["psf_optimal_mm"] = diameters
-        anchors["psf_metric"] = metrics
-        anchors["psf_row_count"] = len(rows)
+        if not diameters:
+            continue
+        anchors["psf_optimal_mm_by_wavelength"][wavelength_nm] = diameters
+        anchors["psf_metric_by_wavelength"][wavelength_nm] = metrics
+        anchors["psf_source_by_wavelength"][wavelength_nm] = str(
+            wavelength_path.relative_to(repository_root)
+        )
+        psf_row_count += len(rows)
+        if math.isclose(
+            wavelength_nm,
+            config.reference_anchor_wavelength_nm,
+            abs_tol=1.0e-6,
+        ):
+            anchors["psf_optimal_mm"] = diameters
+            anchors["psf_metric"] = metrics
+    if psf_row_count:
+        anchors["psf_row_count"] = psf_row_count
     elif config.reuse_previous_metrics:
         raise FileNotFoundError(
             "first-stage metrics are required for cross-check anchors: "
@@ -2493,17 +2610,55 @@ def reference_diameter_mm(
     wavelength_nm: float,
 ) -> tuple[float, str]:
     """给出该近视度数的主锚点孔径，并说明来源。"""
+    retinal_by_wavelength = anchors.get(
+        "retinal_optimal_mm_by_wavelength",
+        {},
+    )
+    for candidate_wavelength, diameters in retinal_by_wavelength.items():
+        if not math.isclose(
+            candidate_wavelength,
+            wavelength_nm,
+            abs_tol=1.0e-6,
+        ):
+            continue
+        retinal_diameter = _lookup_float_key(diameters, myopia_d)
+        if retinal_diameter is not None:
+            source = (
+                "retinal_optotype_primary"
+                if math.isclose(
+                    wavelength_nm,
+                    config.reference_anchor_wavelength_nm,
+                    abs_tol=1.0e-6,
+                )
+                else "retinal_optotype_wavelength"
+            )
+            return float(retinal_diameter), source
+    psf_by_wavelength = anchors.get("psf_optimal_mm_by_wavelength", {})
+    for candidate_wavelength, diameters in psf_by_wavelength.items():
+        if not math.isclose(
+            candidate_wavelength,
+            wavelength_nm,
+            abs_tol=1.0e-6,
+        ):
+            continue
+        psf_diameter = _lookup_float_key(diameters, myopia_d)
+        if psf_diameter is not None:
+            return float(psf_diameter), "psf_d50_crosscheck"
     if math.isclose(
         wavelength_nm,
         config.reference_anchor_wavelength_nm,
         abs_tol=1.0e-6,
     ):
-        retinal_diameter = anchors["retinal_optimal_mm"].get(myopia_d)
+        retinal_diameter = _lookup_float_key(
+            anchors["retinal_optimal_mm"], myopia_d
+        )
         if retinal_diameter is not None:
-            return retinal_diameter, "retinal_optotype_primary"
-        psf_diameter = anchors["psf_optimal_mm"].get(myopia_d)
+            return float(retinal_diameter), "retinal_optotype_primary"
+        psf_diameter = _lookup_float_key(
+            anchors["psf_optimal_mm"], myopia_d
+        )
         if psf_diameter is not None:
-            return psf_diameter, "psf_d50_crosscheck"
+            return float(psf_diameter), "psf_d50_crosscheck"
     if not config.reuse_previous_metrics:
         return (
             theoretical_optimal_diameter_mm(config.psf_config, wavelength_nm, myopia_d),
@@ -3299,6 +3454,7 @@ def compute_image_autocorrelation_metrics(
     if peak <= 0.0:
         return {
             "autocorrelation_peak_to_median": math.nan,
+            "autocorrelation_max_offcentre_value": math.nan,
             "autocorrelation_max_offcentre_radius_arcmin": math.nan,
         }
     coordinate = cp.arange(grid_size, dtype=cp.float32) - centre_index
@@ -3310,10 +3466,14 @@ def compute_image_autocorrelation_metrics(
     if not bool(ring_mask.any()):
         return {
             "autocorrelation_peak_to_median": math.nan,
+            "autocorrelation_max_offcentre_value": math.nan,
             "autocorrelation_max_offcentre_radius_arcmin": math.nan,
         }
     ring_values = autocorrelation[ring_mask]
-    median = float(cp.median(ring_values))
+    absolute_ring_values = cp.abs(ring_values)
+    median_absolute = float(cp.median(absolute_ring_values))
+    if median_absolute <= 0.0:
+        median_absolute = float(cp.mean(absolute_ring_values))
     ring_normalised = ring_values / peak
     max_index = int(cp.argmax(ring_normalised).item())
     max_value = float(ring_normalised[max_index])
@@ -3321,7 +3481,9 @@ def compute_image_autocorrelation_metrics(
     max_radius_px = float(ring_radii_px[max_index])
     return {
         "autocorrelation_peak_to_median": (
-            max_value / (median / peak) if median > 0.0 else math.nan
+            max_value / (median_absolute / peak)
+            if median_absolute > 0.0
+            else math.nan
         ),
         "autocorrelation_max_offcentre_value": max_value,
         "autocorrelation_max_offcentre_radius_arcmin": (
@@ -3672,7 +3834,19 @@ def build_layout_for_pattern(
             config, pitch_mm, diameter_mm, ring_count
         )
     if pattern_kind == ARRAY_PATTERN_CIRCULAR_RINGS:
-        return generate_circular_rings(config, pitch_mm, diameter_mm, holes_per_ring)
+        if holes_per_ring is not None:
+            counts = tuple(holes_per_ring)
+        else:
+            if ring_count > len(config.circular_ring_holes_per_ring):
+                raise ValueError(
+                    "ring_count exceeds configured circular_ring_holes_per_ring"
+                )
+            counts = tuple(
+                config.circular_ring_holes_per_ring[:ring_count]
+            )
+        return generate_circular_rings(
+            config, pitch_mm, diameter_mm, counts
+        )
     raise ValueError(f"unsupported array_pattern_kind: {pattern_kind!r}")
 
 
@@ -4255,6 +4429,212 @@ RING_GEOMETRY_FIELDS: tuple[str, ...] = (
     "geometry_ok",
 )
 
+
+GEOMETRY_FIELDS: tuple[str, ...] = (
+    "pattern_kind",
+    "hole_count",
+    "row_count",
+    "column_count",
+    "pitch_nominal_mm",
+    "diameter_mm",
+    "pitch_to_diameter_ratio",
+    "ring_count",
+    "holes_per_ring",
+    "nearest_neighbor_min_mm",
+    "nearest_neighbor_mean_mm",
+    "core_neighbor_count_max",
+    "edge_clearance_mm",
+    "analytic_area_fraction",
+    "numeric_window_area_fraction",
+    "mask_relative_area_error_percent",
+    "min_circularity",
+    "max_centroid_offset_mm",
+    "geometry_ok",
+    "topology_ok",
+    "mask_ok",
+    "notes",
+)
+
+
+def build_geometry_rows(
+    config: ArrayGhostSimulationConfig,
+) -> list[dict[str, Any]]:
+    """方案第 9 节：array_geometry.csv 的布局与掩膜 QC。"""
+    rows: list[dict[str, Any]] = []
+    for pattern_kind in ARRAY_PATTERN_KINDS:
+        layout = build_layout_for_pattern(
+            config,
+            pattern_kind,
+            config.pattern_schematic_pitch_mm,
+            config.pattern_schematic_diameter_mm,
+            ring_count=config.pattern_schematic_ring_count,
+        )
+        layout_qc = validate_layout(layout, config)
+        mask = rasterize_mask(layout, config)
+        mask_qc = validate_mask(mask, layout, config)
+        rows.append(
+            {
+                "pattern_kind": pattern_kind,
+                "hole_count": layout.hole_count,
+                "row_count": layout.row_count,
+                "column_count": layout.column_count,
+                "pitch_nominal_mm": layout.pitch_nominal_mm,
+                "diameter_mm": layout.diameter_mm,
+                "pitch_to_diameter_ratio": (
+                    layout.pitch_nominal_mm / layout.diameter_mm
+                ),
+                "ring_count": layout.ring_count,
+                "holes_per_ring": "|".join(
+                    str(value) for value in layout.holes_per_ring
+                ),
+                "nearest_neighbor_min_mm": layout_qc[
+                    "nearest_neighbor_min_mm"
+                ],
+                "nearest_neighbor_mean_mm": layout_qc[
+                    "nearest_neighbor_mean_mm"
+                ],
+                "core_neighbor_count_max": layout_qc[
+                    "core_neighbor_count_max"
+                ],
+                "edge_clearance_mm": layout_qc["edge_clearance_mm"],
+                "analytic_area_fraction": layout.analytic_area_fraction,
+                "numeric_window_area_fraction": mask_qc[
+                    "window_area_fraction"
+                ],
+                "mask_relative_area_error_percent": (
+                    mask_qc["relative_area_error"] * 100.0
+                ),
+                "min_circularity": mask_qc["min_circularity"],
+                "max_centroid_offset_mm": mask_qc[
+                    "max_centroid_offset_mm"
+                ],
+                "geometry_ok": layout_qc["geometry_ok"],
+                "topology_ok": layout_qc["topology_ok"],
+                "mask_ok": mask_qc["mask_ok"],
+                "notes": layout.notes,
+            }
+        )
+    return rows
+
+
+SOLAR_CONVERGENCE_FIELDS: tuple[str, ...] = (
+    "radial_ring_count",
+    "azimuth_sample_count",
+    "direction_sample_count",
+    "width_arcmin",
+    "peak",
+    "total_energy",
+    "width_error_vs_disk_percent",
+    "peak_error_vs_disk_percent",
+    "width_pass",
+    "peak_pass",
+    "notes",
+)
+
+
+def build_solar_convergence_rows(
+    config: ArrayGhostSimulationConfig,
+    anchors: dict[str, Any],
+    psf_cache: PinholePsfCache,
+) -> list[dict[str, Any]]:
+    """方案第 9 节：solar_convergence.csv 的采样收敛表。"""
+    myopia_d = (
+        config.quick_myopia_values_d[0]
+        if config.quick_mode
+        else config.representative_myopia_d
+    )
+    diameter_mm, _source = reference_diameter_mm(
+        config, anchors, myopia_d, config.primary_wavelength_nm
+    )
+    psf, sampling = psf_cache.get(
+        config, diameter_mm, myopia_d, config.primary_wavelength_nm
+    )
+    grid_size = config.solar_convergence_grid_size
+    psf_grid = resample_psf_to_grid(
+        psf,
+        sampling.angular_pixel_arcmin,
+        grid_size,
+        config.analysis_pixel_arcmin,
+        config,
+    )
+    disk_kernel, _disk_metadata = build_solar_disk_kernel(
+        config, grid_size, config.analysis_pixel_arcmin
+    )
+    convolved, _convolution_metadata = convolve_with_solar_disk(
+        psf_grid, disk_kernel, config
+    )
+    reference_width_arcmin = measure_image_width_arcmin(
+        convolved,
+        config.analysis_pixel_arcmin,
+        config.sun_width_energy_fraction,
+        config,
+    )
+    reference_peak = float(convolved.max())
+    sample_pairs = (
+        (
+            config.solar_radial_ring_count,
+            config.solar_azimuth_sample_count,
+        ),
+        (
+            config.solar_radial_ring_dense_count,
+            config.solar_azimuth_dense_count,
+        ),
+    )
+    rows: list[dict[str, Any]] = []
+    for radial_ring_count, azimuth_sample_count in dict.fromkeys(sample_pairs):
+        directions, direction_weights = build_solar_directions(
+            config,
+            radial_ring_count,
+            azimuth_sample_count,
+        )
+        direct = integrate_solar_source_direct(
+            psf_grid,
+            directions,
+            direction_weights,
+            config.analysis_pixel_arcmin,
+            config,
+        )
+        direct_width_arcmin = measure_image_width_arcmin(
+            direct,
+            config.analysis_pixel_arcmin,
+            config.sun_width_energy_fraction,
+            config,
+        )
+        direct_peak = float(direct.max())
+        width_error_percent = (
+            100.0
+            * abs(direct_width_arcmin - reference_width_arcmin)
+            / reference_width_arcmin
+        )
+        peak_error_percent = (
+            100.0 * abs(direct_peak - reference_peak) / reference_peak
+        )
+        rows.append(
+            {
+                "radial_ring_count": radial_ring_count,
+                "azimuth_sample_count": azimuth_sample_count,
+                "direction_sample_count": int(directions.shape[0]),
+                "width_arcmin": direct_width_arcmin,
+                "peak": direct_peak,
+                "total_energy": float(
+                    direct.sum(dtype=config.accumulator_dtype)
+                ),
+                "width_error_vs_disk_percent": width_error_percent,
+                "peak_error_vs_disk_percent": peak_error_percent,
+                "width_pass": bool(
+                    width_error_percent
+                    <= config.solar_convergence_width_tolerance_percent
+                ),
+                "peak_pass": bool(
+                    peak_error_percent
+                    <= config.solar_convergence_peak_tolerance_percent
+                ),
+                "notes": "reference is the area-weighted solar-disk convolution",
+            }
+        )
+    return rows
+
+
 GHOST_PEAK_FIELDS: tuple[str, ...] = (
     "comparison_group",
     "pattern_kind",
@@ -4533,7 +4913,7 @@ def build_validation_rows(
     psf, sampling = psf_cache.get(
         config, diameter_mm, myopia_d, config.primary_wavelength_nm
     )
-    grid_size = 256
+    grid_size = config.solar_convergence_grid_size
     psf_grid = resample_psf_to_grid(
         psf,
         sampling.angular_pixel_arcmin,
@@ -4889,10 +5269,12 @@ def write_all_outputs(
     metric_rows: list[dict[str, Any]],
     peak_rows: list[dict[str, Any]],
     ring_rows: list[dict[str, Any]],
+    geometry_rows: list[dict[str, Any]],
     selection_rows: list[dict[str, Any]],
     coarse_rows: list[dict[str, Any]],
     pareto_rows: list[dict[str, Any]],
     validation_rows: list[dict[str, Any]],
+    solar_convergence_rows: list[dict[str, Any]],
     config_payload: dict[str, Any],
 ) -> Path:
     """按方案第 9 节的清单落盘。"""
@@ -4926,6 +5308,11 @@ def write_all_outputs(
         directory / config.ring_geometry_filename,
         ring_rows,
         RING_GEOMETRY_FIELDS,
+    )
+    write_csv(
+        directory / config.geometry_filename,
+        geometry_rows,
+        GEOMETRY_FIELDS,
     )
     write_csv(
         directory / config.refined_grid_filename,
@@ -4974,11 +5361,1207 @@ def write_all_outputs(
         validation_rows,
         VALIDATION_FIELDS,
     )
+    write_csv(
+        directory / config.solar_convergence_filename,
+        solar_convergence_rows,
+        SOLAR_CONVERGENCE_FIELDS,
+    )
     with (directory / config.config_filename).open(
         "w", encoding="utf-8"
     ) as file:
         json.dump(config_payload, file, ensure_ascii=False, indent=2)
     return directory
+
+
+def array_pattern_display_name(pattern_kind: str) -> str:
+    """返回图中使用的双语阵列名称。"""
+    return PATTERN_DISPLAY_NAMES.get(pattern_kind, pattern_kind)
+
+
+def _pattern_colours(
+    config: ArrayGhostSimulationConfig,
+    patterns: Sequence[str],
+) -> dict[str, Any]:
+    """为各排布分配稳定的离散颜色。"""
+    if not patterns:
+        return {}
+    colour_map = plt.get_cmap(config.pattern_colormap_name)
+    denominator = max(1, len(patterns) - 1)
+    return {
+        pattern: colour_map(index / denominator)
+        for index, pattern in enumerate(patterns)
+    }
+
+
+def _rows_for_group(
+    rows: Sequence[dict[str, Any]],
+    comparison_group: str,
+) -> list[dict[str, Any]]:
+    return [
+        row
+        for row in rows
+        if row["comparison_group"] == comparison_group
+    ]
+
+
+def _rows_for_group_prefix(
+    rows: Sequence[dict[str, Any]],
+    group_prefix: str,
+) -> list[dict[str, Any]]:
+    return [
+        row
+        for row in rows
+        if str(row["comparison_group"]).startswith(group_prefix)
+    ]
+
+
+def _row_float(row: dict[str, Any], field_name: str) -> float:
+    return float(row[field_name])
+
+
+def _row_int(row: dict[str, Any], field_name: str) -> int:
+    return int(float(row[field_name]))
+
+
+def _representative_layout(
+    config: ArrayGhostSimulationConfig,
+    row: dict[str, Any],
+    ring_count: int | None = None,
+) -> ArrayLayout:
+    return build_layout_for_pattern(
+        config,
+        str(row["pattern_kind"]),
+        _row_float(row, "pitch_mm"),
+        _row_float(row, "diameter_mm"),
+        ring_count=(
+            _row_int(row, "ring_count")
+            if ring_count is None
+            else ring_count
+        ),
+    )
+
+
+def _render_array_image(
+    config: ArrayGhostSimulationConfig,
+    row: dict[str, Any],
+    psf_cache: PinholePsfCache,
+    kernel_cache: SolarKernelCache,
+    use_solar_disk: bool,
+) -> tuple[Any, dict[str, Any], ArrayLayout, float]:
+    """按一行扫描指标重建对应的阵列强度图。"""
+    layout = _representative_layout(config, row)
+    diameter_mm = _row_float(row, "diameter_mm")
+    myopia_d = _row_float(row, "myopia_d")
+    wavelength_nm = _row_float(row, "wavelength_nm")
+    if use_solar_disk:
+        kernel, image_width_arcmin, _metadata = kernel_cache.get(
+            config, psf_cache, diameter_mm, myopia_d, wavelength_nm
+        )
+        kernel_pixel_arcmin = config.analysis_pixel_arcmin
+    else:
+        psf, sampling = psf_cache.get(
+            config, diameter_mm, myopia_d, wavelength_nm
+        )
+        kernel = resample_psf_to_grid(
+            psf,
+            sampling.angular_pixel_arcmin,
+            config.effective_analysis_grid_size(),
+            config.analysis_pixel_arcmin,
+            config,
+        )
+        kernel_pixel_arcmin = config.analysis_pixel_arcmin
+        image_width_arcmin = measure_image_width_arcmin(
+            kernel,
+            kernel_pixel_arcmin,
+            config.sun_width_energy_fraction,
+            config,
+        )
+    weights_np, _weight_model = compute_hole_weights(
+        layout,
+        _row_float(row, "pupil_diameter_mm"),
+        config,
+    )
+    shifts_np = (
+        layout.centers_mm / config.focal_length_mm * ARCMINUTES_PER_RADIAN
+    )
+    shifts = cp.asarray(shifts_np, dtype=cp.float32)
+    weights = cp.asarray(weights_np, dtype=config.accumulator_dtype)
+    field = plan_field_grid(shifts, image_width_arcmin, config)
+    result = accumulate_shifted_kernels(
+        kernel,
+        kernel_pixel_arcmin,
+        shifts,
+        weights,
+        field,
+        config,
+    )
+    return result, field, layout, image_width_arcmin
+
+
+def _display_image_panel(
+    axis: plt.Axes,
+    result: dict[str, Any],
+    field: dict[str, Any],
+    config: ArrayGhostSimulationConfig,
+    title: str,
+) -> None:
+    host_image = cp.asnumpy(result["image"])
+    peak = max(float(host_image.max()), np.finfo(np.float64).tiny)
+    floor = max(
+        peak * (10.0 ** (-config.image_log_dynamic_range)),
+        np.finfo(np.float64).tiny,
+    )
+    half_width_arcmin = float(field["half_width_arcmin"])
+    axis.imshow(
+        host_image,
+        origin="lower",
+        extent=(
+            -half_width_arcmin,
+            half_width_arcmin,
+            -half_width_arcmin,
+            half_width_arcmin,
+        ),
+        cmap=config.image_colormap_name,
+        norm=LogNorm(vmin=floor, vmax=peak),
+        interpolation="nearest",
+    )
+    axis.set_title(title, fontsize=config.panel_title_font_size)
+    axis.set_xlabel(
+        "视网膜角坐标 / Retinal angle (arcmin)",
+        fontsize=config.axis_label_font_size,
+    )
+    axis.set_ylabel(
+        "视网膜角坐标 / Retinal angle (arcmin)",
+        fontsize=config.axis_label_font_size,
+    )
+    axis.tick_params(labelsize=config.tick_font_size)
+    axis.set_aspect("equal")
+
+
+def _add_ghost_order_circles(
+    axis: plt.Axes,
+    pitch_mm: float,
+    config: ArrayGhostSimulationConfig,
+) -> None:
+    first_order_angle_arcmin = (
+        pitch_mm / config.focal_length_mm * ARCMINUTES_PER_RADIAN
+    )
+    for order, line_style, label in (
+        (1, "--", "一阶 / first order p/f"),
+        (2, ":", "二阶 / second order 2p/f"),
+    ):
+        axis.add_patch(
+            plt.Circle(
+                (0.0, 0.0),
+                order * first_order_angle_arcmin,
+                fill=False,
+                edgecolor="white",
+                linestyle=line_style,
+                linewidth=1.2,
+                alpha=0.85,
+                label=label,
+            )
+        )
+    axis.legend(
+        loc="upper right",
+        fontsize=config.legend_font_size,
+        framealpha=0.78,
+    )
+
+
+def _save_figure(
+    figure: plt.Figure,
+    output_path: Path,
+    config: ArrayGhostSimulationConfig,
+    suptitle: str,
+) -> None:
+    if config.quick_mode:
+        suptitle = f"[quick 冒烟图，不作正式结论 / smoke test] {suptitle}"
+    figure.suptitle(
+        suptitle,
+        fontsize=config.suptitle_font_size,
+        y=0.985,
+    )
+    figure.tight_layout(
+        rect=(0.0, 0.02, 1.0, 0.95),
+        h_pad=config.figure_tight_layout_h_pad,
+        w_pad=config.figure_tight_layout_w_pad,
+    )
+    figure.savefig(
+        output_path,
+        dpi=config.figure_dpi,
+        bbox_inches="tight",
+        facecolor="white",
+    )
+    plt.close(figure)
+
+
+def save_array_pattern_figure(
+    config: ArrayGhostSimulationConfig,
+    directory: Path,
+) -> None:
+    """方案第 9 节：五种孔心排布总览。"""
+    patterns = ARRAY_PATTERN_KINDS
+    row_count, column_count = _figure_grid_shape(len(patterns))
+    figure, axes = plt.subplots(
+        row_count,
+        column_count,
+        figsize=config.pattern_figure_size_inches,
+        dpi=config.figure_dpi,
+        squeeze=False,
+    )
+    axis_list = axes.ravel()
+    for axis in axis_list[len(patterns) :]:
+        axis.axis("off")
+    colours = _pattern_colours(config, patterns)
+    for axis, pattern_kind in zip(axis_list, patterns):
+        layout = build_layout_for_pattern(
+            config,
+            pattern_kind,
+            config.pattern_schematic_pitch_mm,
+            config.pattern_schematic_diameter_mm,
+            ring_count=config.pattern_schematic_ring_count,
+        )
+        radius_mm = 0.5 * layout.diameter_mm
+        for centre_x_mm, centre_y_mm in layout.centers_mm:
+            axis.add_patch(
+                plt.Circle(
+                    (centre_x_mm, centre_y_mm),
+                    radius_mm,
+                    facecolor=colours[pattern_kind],
+                    edgecolor="black",
+                    linewidth=0.35,
+                    alpha=0.78,
+                )
+            )
+        half_extent = config.pattern_schematic_half_extent_mm
+        axis.set_xlim(-half_extent, half_extent)
+        axis.set_ylim(-half_extent, half_extent)
+        axis.set_aspect("equal")
+        axis.grid(alpha=0.16)
+        axis.tick_params(labelsize=config.tick_font_size)
+        axis.set_xlabel(
+            "x (mm)",
+            fontsize=config.axis_label_font_size,
+        )
+        axis.set_ylabel(
+            "y (mm)",
+            fontsize=config.axis_label_font_size,
+        )
+        axis.set_title(
+            f"{array_pattern_display_name(pattern_kind)}\n"
+            f"N={layout.hole_count}, p={layout.pitch_nominal_mm:g} mm, "
+            f"d={layout.diameter_mm:g} mm",
+            fontsize=config.panel_title_font_size,
+        )
+    _save_figure(
+        figure,
+        directory / config.pattern_figure_filename,
+        config,
+        "第三阶段孔心排布对比 / Third-stage hole-centre layouts",
+    )
+
+
+def save_mask_figure(
+    config: ArrayGhostSimulationConfig,
+    directory: Path,
+) -> None:
+    """方案第 9 节：五种排布的抗锯齿掩膜。"""
+    patterns = ARRAY_PATTERN_KINDS
+    row_count, column_count = _figure_grid_shape(len(patterns))
+    figure, axes = plt.subplots(
+        row_count,
+        column_count,
+        figsize=config.mask_figure_size_inches,
+        dpi=config.figure_dpi,
+        squeeze=False,
+    )
+    axis_list = axes.ravel()
+    for axis in axis_list[len(patterns) :]:
+        axis.axis("off")
+    for axis, pattern_kind in zip(axis_list, patterns):
+        layout = build_layout_for_pattern(
+            config,
+            pattern_kind,
+            config.pattern_schematic_pitch_mm,
+            config.pattern_schematic_diameter_mm,
+            ring_count=config.pattern_schematic_ring_count,
+        )
+        mask = rasterize_mask(layout, config)
+        x_axis_mm, y_axis_mm = mask.axes_mm()
+        image = axis.imshow(
+            mask.coverage,
+            origin="lower",
+            extent=(
+                float(x_axis_mm[0]),
+                float(x_axis_mm[-1]),
+                float(y_axis_mm[0]),
+                float(y_axis_mm[-1]),
+            ),
+            cmap=config.pattern_colormap_name,
+            vmin=0.0,
+            vmax=1.0,
+            interpolation="nearest",
+        )
+        axis.set_aspect("equal")
+        axis.set_title(
+            f"{array_pattern_display_name(pattern_kind)}\n"
+            f"N={layout.hole_count}, pixel={mask.pixel_mm:.4f} mm",
+            fontsize=config.panel_title_font_size,
+        )
+        axis.set_xlabel("x (mm)", fontsize=config.axis_label_font_size)
+        axis.set_ylabel("y (mm)", fontsize=config.axis_label_font_size)
+        axis.tick_params(labelsize=config.tick_font_size)
+        colorbar = axis.figure.colorbar(image, ax=axis, pad=0.02)
+        colorbar.set_label(
+            "面积覆盖度 / Coverage",
+            fontsize=config.axis_label_font_size,
+        )
+        colorbar.ax.tick_params(labelsize=config.tick_font_size)
+    _save_figure(
+        figure,
+        directory / config.mask_figure_filename,
+        config,
+        "抗锯齿孔阵列掩膜 / Anti-aliased hole masks",
+    )
+
+
+def _rows_at_smallest_pitch(
+    rows: Sequence[dict[str, Any]],
+    patterns: Sequence[str],
+) -> list[dict[str, Any]]:
+    if not rows:
+        return []
+    minimum_pitch_mm = min(_row_float(row, "pitch_mm") for row in rows)
+    selected_by_pattern: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        if not math.isclose(
+            _row_float(row, "pitch_mm"),
+            minimum_pitch_mm,
+            rel_tol=1.0e-12,
+            abs_tol=1.0e-12,
+        ):
+            continue
+        selected_by_pattern.setdefault(str(row["pattern_kind"]), row)
+    return [
+        selected_by_pattern[pattern]
+        for pattern in patterns
+        if pattern in selected_by_pattern
+    ]
+
+
+def _figure_grid_shape(panel_count: int) -> tuple[int, int]:
+    if panel_count <= 1:
+        return 1, 1
+    column_count = min(4, int(math.ceil(math.sqrt(panel_count))))
+    row_count = int(math.ceil(panel_count / column_count))
+    return row_count, column_count
+
+
+def save_point_source_array_psf_figure(
+    config: ArrayGhostSimulationConfig,
+    metric_rows: Sequence[dict[str, Any]],
+    psf_cache: PinholePsfCache,
+    directory: Path,
+) -> None:
+    """点源阵列 PSF：突出平移复制与一阶、二阶重影。"""
+    rows = _rows_at_smallest_pitch(
+        _rows_for_group(metric_rows, "fixed_hole_count_layout"),
+        ARRAY_PATTERN_KINDS,
+    )
+    row_count, column_count = _figure_grid_shape(len(rows))
+    figure, axes = plt.subplots(
+        row_count,
+        column_count,
+        figsize=config.point_source_figure_size_inches,
+        dpi=config.figure_dpi,
+        squeeze=False,
+    )
+    for axis in axes.ravel()[len(rows) :]:
+        axis.axis("off")
+    kernel_cache = SolarKernelCache()
+    for axis, row in zip(axes.ravel(), rows):
+        result, field, layout, _width = _render_array_image(
+            config,
+            row,
+            psf_cache,
+            kernel_cache,
+            use_solar_disk=False,
+        )
+        _display_image_panel(
+            axis,
+            result,
+            field,
+            config,
+            f"{array_pattern_display_name(layout.pattern_kind)}\n"
+            f"p={layout.pitch_nominal_mm:g} mm, d={layout.diameter_mm:g} mm, "
+            f"N={layout.hole_count}",
+        )
+        _add_ghost_order_circles(axis, layout.pitch_nominal_mm, config)
+    _save_figure(
+        figure,
+        directory / config.point_source_figure_filename,
+        config,
+        "点源阵列 PSF 与重影阶次 / Point-source array PSF and ghost orders",
+    )
+
+
+def save_solar_ghost_comparison_figure(
+    config: ArrayGhostSimulationConfig,
+    metric_rows: Sequence[dict[str, Any]],
+    psf_cache: PinholePsfCache,
+    kernel_cache: SolarKernelCache,
+    directory: Path,
+) -> None:
+    """太阳照明下比较五种排布的像场、峰比、分离比和风险标签。"""
+    rows = _rows_at_smallest_pitch(
+        _rows_for_group(metric_rows, "fixed_hole_count_layout"),
+        ARRAY_PATTERN_KINDS,
+    )
+    row_count, column_count = _figure_grid_shape(len(rows))
+    figure, axes = plt.subplots(
+        row_count,
+        column_count,
+        figsize=config.solar_comparison_figure_size_inches,
+        dpi=config.figure_dpi,
+        squeeze=False,
+    )
+    for axis in axes.ravel()[len(rows) :]:
+        axis.axis("off")
+    for axis, row in zip(axes.ravel(), rows):
+        result, field, layout, _width = _render_array_image(
+            config,
+            row,
+            psf_cache,
+            kernel_cache,
+            use_solar_disk=True,
+        )
+        _display_image_panel(
+            axis,
+            result,
+            field,
+            config,
+            f"{array_pattern_display_name(layout.pattern_kind)}\n"
+            f"N={layout.hole_count}, "
+            f"S/W={_row_float(row, 'separation_to_width_ratio'):.2f}, "
+            f"peak={_row_float(row, 'max_ghost_peak_ratio'):.3f}, "
+            f"E_g={_row_float(row, 'ghost_integrated_fraction'):.3f}",
+        )
+        axis.text(
+            0.02,
+            0.98,
+            f"风险 / Risk: {row['primary_risk_label']}",
+            transform=axis.transAxes,
+            ha="left",
+            va="top",
+            fontsize=config.conclusion_font_size,
+            color="white",
+            bbox={
+                "facecolor": "black",
+                "alpha": 0.55,
+                "edgecolor": "none",
+                "pad": 2.0,
+            },
+        )
+    _save_figure(
+        figure,
+        directory / config.solar_comparison_figure_filename,
+        config,
+        "太阳扩展源下的阵列重影对比 / Solar-source array ghost comparison",
+    )
+
+
+def save_ring_count_comparison_figure(
+    config: ArrayGhostSimulationConfig,
+    metric_rows: Sequence[dict[str, Any]],
+    psf_cache: PinholePsfCache,
+    kernel_cache: SolarKernelCache,
+    directory: Path,
+) -> None:
+    """展示中心孔外增加同心环时，离散重影怎样变成环状背景。"""
+    rows = _rows_for_group(metric_rows, "ring_growth")
+    unique_rows: dict[tuple[str, int, int], dict[str, Any]] = {}
+    for row in rows:
+        key = (
+            str(row["pattern_kind"]),
+            _row_int(row, "ring_count"),
+            _row_int(row, "hole_count"),
+        )
+        unique_rows.setdefault(key, row)
+    rows = sorted(
+        unique_rows.values(),
+        key=lambda row: (
+            str(row["pattern_kind"]),
+            _row_int(row, "ring_count"),
+            _row_int(row, "hole_count"),
+        ),
+    )
+    row_count, column_count = _figure_grid_shape(len(rows))
+    figure, axes = plt.subplots(
+        row_count,
+        column_count,
+        figsize=config.ring_comparison_figure_size_inches,
+        dpi=config.figure_dpi,
+        squeeze=False,
+    )
+    for axis in axes.ravel()[len(rows) :]:
+        axis.axis("off")
+    for axis, row in zip(axes.ravel(), rows):
+        result, field, layout, _width = _render_array_image(
+            config,
+            row,
+            psf_cache,
+            kernel_cache,
+            use_solar_disk=True,
+        )
+        _display_image_panel(
+            axis,
+            result,
+            field,
+            config,
+            f"{array_pattern_display_name(layout.pattern_kind)}\n"
+            f"rings={layout.ring_count}, holes={layout.hole_count}, "
+            f"E_g={_row_float(row, 'ghost_integrated_fraction'):.3f}",
+        )
+    _save_figure(
+        figure,
+        directory / config.ring_comparison_figure_filename,
+        config,
+        "同心环数量对重影演化的影响 / Ghost evolution with concentric-ring count",
+    )
+
+
+def _grid_matrix(
+    rows: Sequence[dict[str, Any]],
+    value_field: str,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    diameters = np.asarray(
+        sorted({_row_float(row, "diameter_mm") for row in rows}),
+        dtype=np.float64,
+    )
+    pitches = np.asarray(
+        sorted({_row_float(row, "pitch_mm") for row in rows}),
+        dtype=np.float64,
+    )
+    diameter_index = {
+        value: index for index, value in enumerate(diameters)
+    }
+    pitch_index = {value: index for index, value in enumerate(pitches)}
+    matrix = np.full(
+        (pitches.size, diameters.size),
+        np.nan,
+        dtype=np.float64,
+    )
+    for row in rows:
+        row_index = pitch_index[_row_float(row, "pitch_mm")]
+        column_index = diameter_index[_row_float(row, "diameter_mm")]
+        matrix[row_index, column_index] = _row_float(row, value_field)
+    return diameters, pitches, matrix
+
+
+def _single_value_axis_extent(
+    values: np.ndarray,
+    config: ArrayGhostSimulationConfig,
+) -> tuple[float, float]:
+    lower = float(values.min())
+    upper = float(values.max())
+    if not math.isclose(lower, upper, rel_tol=1.0e-12, abs_tol=1.0e-15):
+        return lower, upper
+    half_width = max(
+        abs(lower) * config.heatmap_singleton_extent_fraction,
+        config.heatmap_singleton_extent_fraction,
+    )
+    return lower - half_width, upper + half_width
+
+
+def save_ghost_angle_heatmap_figure(
+    config: ArrayGhostSimulationConfig,
+    metric_rows: Sequence[dict[str, Any]],
+    directory: Path,
+) -> None:
+    """d-p 网格上的重影角与分离宽度比热图。"""
+    patterns = ARRAY_PATTERN_KINDS[:3]
+    figure, axes = plt.subplots(
+        len(patterns),
+        2,
+        figsize=config.ghost_heatmap_figure_size_inches,
+        dpi=config.figure_dpi,
+        squeeze=False,
+    )
+    rows_by_pattern = {
+        pattern: [
+            row
+            for row in _rows_for_group(metric_rows, "diameter_pitch_grid")
+            if str(row["pattern_kind"]) == pattern
+        ]
+        for pattern in patterns
+    }
+    for row_index, pattern in enumerate(patterns):
+        rows = rows_by_pattern[pattern]
+        if not rows:
+            continue
+        for column_index, (field_name, label) in enumerate(
+            (
+                ("first_order_angle_arcmin", "一阶重影角 / First-order angle"),
+                (
+                    "separation_to_width_ratio",
+                    "分离宽度比 / Separation-to-width",
+                ),
+            )
+        ):
+            axis = axes[row_index, column_index]
+            diameters, pitches, matrix = _grid_matrix(rows, field_name)
+            diameter_extent = _single_value_axis_extent(diameters, config)
+            pitch_extent = _single_value_axis_extent(pitches, config)
+            image = axis.imshow(
+                matrix,
+                origin="lower",
+                aspect="auto",
+                extent=(
+                    diameter_extent[0],
+                    diameter_extent[1],
+                    pitch_extent[0],
+                    pitch_extent[1],
+                ),
+                cmap=config.heatmap_colormap_name,
+            )
+            axis.set_title(
+                f"{array_pattern_display_name(pattern)}\n{label}",
+                fontsize=config.panel_title_font_size,
+            )
+            axis.set_xlabel(
+                "孔径 d / Pinhole diameter (mm)",
+                fontsize=config.axis_label_font_size,
+            )
+            axis.set_ylabel(
+                "孔距 p / Pitch (mm)",
+                fontsize=config.axis_label_font_size,
+            )
+            axis.tick_params(labelsize=config.tick_font_size)
+            colorbar = axis.figure.colorbar(image, ax=axis, pad=0.02)
+            colorbar.set_label(
+                "角分 / arcmin"
+                if field_name == "first_order_angle_arcmin"
+                else "无量纲 / Dimensionless",
+                fontsize=config.axis_label_font_size,
+            )
+            colorbar.ax.tick_params(labelsize=config.tick_font_size)
+    _save_figure(
+        figure,
+        directory / config.ghost_heatmap_figure_filename,
+        config,
+        "d-p 重影角与分离度热图 / Ghost-angle and separation heatmaps",
+    )
+
+
+def save_diameter_pitch_relation_figure(
+    config: ArrayGhostSimulationConfig,
+    metric_rows: Sequence[dict[str, Any]],
+    directory: Path,
+) -> None:
+    """展示 p/d 与峰比、分离度、方向规则性及风险标签的关系。"""
+    patterns = ARRAY_PATTERN_KINDS[:3]
+    rows = _rows_for_group(metric_rows, "diameter_pitch_grid")
+    pareto_keys = {
+        (
+            str(row["pattern_kind"]),
+            _row_float(row, "diameter_mm"),
+            _row_float(row, "pitch_mm"),
+        )
+        for row in compute_pareto_front(metric_rows)
+    }
+    figure, axes = plt.subplots(
+        1,
+        len(patterns),
+        figsize=config.diameter_pitch_figure_size_inches,
+        dpi=config.figure_dpi,
+        squeeze=False,
+    )
+    for axis, pattern in zip(axes.ravel(), patterns):
+        pattern_rows = [
+            row for row in rows if str(row["pattern_kind"]) == pattern
+        ]
+        if not pattern_rows:
+            axis.axis("off")
+            continue
+        x_values = np.asarray(
+            [
+                _row_float(row, "pitch_to_diameter_ratio")
+                for row in pattern_rows
+            ],
+            dtype=np.float64,
+        )
+        y_values = np.asarray(
+            [
+                100.0
+                * (1.0 - _row_float(row, "max_ghost_peak_ratio"))
+                for row in pattern_rows
+            ],
+            dtype=np.float64,
+        )
+        colours = np.asarray(
+            [
+                _row_float(row, "separation_to_width_ratio")
+                for row in pattern_rows
+            ],
+            dtype=np.float64,
+        )
+        sizes = np.asarray(
+            [
+                config.pattern_marker_size
+                * (
+                    1.0
+                    + _row_float(row, "direction_anisotropy")
+                )
+                for row in pattern_rows
+            ],
+            dtype=np.float64,
+        )
+        scatter = axis.scatter(
+            x_values,
+            y_values,
+            c=colours,
+            s=sizes,
+            cmap=config.heatmap_colormap_name,
+            alpha=config.scatter_marker_alpha,
+            edgecolors="black",
+            linewidths=0.3,
+        )
+        pareto_x = []
+        pareto_y = []
+        for row in pattern_rows:
+            key = (
+                pattern,
+                _row_float(row, "diameter_mm"),
+                _row_float(row, "pitch_mm"),
+            )
+            if key in pareto_keys:
+                pareto_x.append(_row_float(row, "pitch_to_diameter_ratio"))
+                pareto_y.append(
+                    100.0
+                    * (1.0 - _row_float(row, "max_ghost_peak_ratio"))
+                )
+        axis.scatter(
+            pareto_x,
+            pareto_y,
+            facecolors="none",
+            edgecolors="white",
+            s=config.pattern_marker_size * 3.0,
+            linewidths=1.4,
+            label="Pareto",
+        )
+        risk_counts = Counter(
+            str(row["primary_risk_label"]) for row in pattern_rows
+        )
+        risk_text = "\n".join(
+            f"{label}: {count}" for label, count in risk_counts.most_common()
+        )
+        axis.text(
+            0.03,
+            0.97,
+            risk_text,
+            transform=axis.transAxes,
+            ha="left",
+            va="top",
+            fontsize=config.legend_font_size,
+            bbox={
+                "facecolor": "white",
+                "alpha": 0.82,
+                "edgecolor": "0.7",
+                "pad": 2.0,
+            },
+        )
+        axis.set_title(
+            array_pattern_display_name(pattern),
+            fontsize=config.panel_title_font_size,
+        )
+        axis.set_xlabel(
+            "相对关系 p/d / Ratio p/d",
+            fontsize=config.axis_label_font_size,
+        )
+        axis.set_ylabel(
+            "峰比偏差 / 1 - ghost peak ratio (%)",
+            fontsize=config.axis_label_font_size,
+        )
+        axis.axhline(
+            0.0,
+            color="0.4",
+            linewidth=0.8,
+            linestyle="--",
+        )
+        axis.grid(alpha=0.22)
+        axis.tick_params(labelsize=config.tick_font_size)
+        axis.legend(fontsize=config.legend_font_size, loc="lower right")
+        colorbar = axis.figure.colorbar(scatter, ax=axis, pad=0.02)
+        colorbar.set_label(
+            "分离宽度比 / Separation-to-width",
+            fontsize=config.axis_label_font_size,
+        )
+        colorbar.ax.tick_params(labelsize=config.tick_font_size)
+    _save_figure(
+        figure,
+        directory / config.diameter_pitch_figure_filename,
+        config,
+        "p/d 与重影风险关系 / p/d versus ghost risk",
+    )
+
+
+def _rows_close_to_value(
+    rows: Sequence[dict[str, Any]],
+    field_name: str,
+    target_value: float,
+    config: ArrayGhostSimulationConfig,
+) -> list[dict[str, Any]]:
+    tolerance = max(
+        abs(target_value) * config.slice_selection_tolerance_fraction,
+        np.finfo(np.float64).eps,
+    )
+    return [
+        row
+        for row in rows
+        if abs(_row_float(row, field_name) - target_value) <= tolerance
+    ]
+
+
+def save_pitch_diameter_slices_figure(
+    config: ArrayGhostSimulationConfig,
+    metric_rows: Sequence[dict[str, Any]],
+    directory: Path,
+) -> None:
+    """固定 p、固定 d、固定 p/d 三种切法。"""
+    grid_rows = _rows_for_group(metric_rows, "diameter_pitch_grid")
+    patterns = ARRAY_PATTERN_KINDS[:3]
+    colours = _pattern_colours(config, patterns)
+    if not grid_rows:
+        return
+    fixed_pitch_mm = min(
+        _row_float(row, "pitch_mm") for row in grid_rows
+    )
+    fixed_diameter_mm = min(
+        grid_rows,
+        key=lambda row: abs(
+            _row_float(row, "diameter_mm")
+            - config.design_point_diameter_mm[0]
+        ),
+    )["diameter_mm"]
+    requested_ratio = config.pitch_to_diameter_ratio_values[0]
+    fixed_ratio = min(
+        grid_rows,
+        key=lambda row: abs(
+            _row_float(row, "pitch_to_diameter_ratio") - requested_ratio
+        ),
+    )["pitch_to_diameter_ratio"]
+    figure, axes = plt.subplots(
+        1,
+        3,
+        figsize=config.slice_figure_size_inches,
+        dpi=config.figure_dpi,
+        squeeze=False,
+    )
+    slice_specs = (
+        (
+            axes[0, 0],
+            "pitch_mm",
+            float(fixed_pitch_mm),
+            "diameter_mm",
+            "固定孔距 / Fixed pitch",
+        ),
+        (
+            axes[0, 1],
+            "diameter_mm",
+            float(fixed_diameter_mm),
+            "pitch_mm",
+            "固定孔径 / Fixed diameter",
+        ),
+        (
+            axes[0, 2],
+            "pitch_to_diameter_ratio",
+            float(fixed_ratio),
+            "diameter_mm",
+            "固定相对关系 / Fixed p/d",
+        ),
+    )
+    for axis, fixed_field, fixed_value, variable_field, title in slice_specs:
+        selected_rows = _rows_close_to_value(
+            grid_rows,
+            fixed_field,
+            fixed_value,
+            config,
+        )
+        for pattern in patterns:
+            pattern_rows = sorted(
+                (
+                    row
+                    for row in selected_rows
+                    if str(row["pattern_kind"]) == pattern
+                ),
+                key=lambda row: _row_float(row, variable_field),
+            )
+            if not pattern_rows:
+                continue
+            x_values = [
+                _row_float(row, variable_field) for row in pattern_rows
+            ]
+            axis.plot(
+                x_values,
+                [
+                    _row_float(row, "separation_to_width_ratio")
+                    for row in pattern_rows
+                ],
+                marker="o",
+                linewidth=1.5,
+                color=colours[pattern],
+                label=f"{array_pattern_display_name(pattern)} S/W",
+            )
+        axis.set_title(title, fontsize=config.panel_title_font_size)
+        axis.set_xlabel(
+            (
+                "孔径 d / Diameter (mm)"
+                if variable_field == "diameter_mm"
+                else "孔距 p / Pitch (mm)"
+            ),
+            fontsize=config.axis_label_font_size,
+        )
+        axis.set_ylabel(
+            "分离宽度比 / Separation-to-width",
+            fontsize=config.axis_label_font_size,
+        )
+        axis.grid(alpha=0.22)
+        axis.tick_params(labelsize=config.tick_font_size)
+        axis.legend(fontsize=config.legend_font_size, loc="best")
+        secondary_axis = axis.twinx()
+        for pattern in patterns:
+            pattern_rows = sorted(
+                (
+                    row
+                    for row in selected_rows
+                    if str(row["pattern_kind"]) == pattern
+                ),
+                key=lambda row: _row_float(row, variable_field),
+            )
+            if not pattern_rows:
+                continue
+            secondary_axis.plot(
+                [
+                    _row_float(row, variable_field)
+                    for row in pattern_rows
+                ],
+                [
+                    _row_float(row, "max_ghost_peak_ratio")
+                    for row in pattern_rows
+                ],
+                marker="s",
+                linestyle="--",
+                linewidth=1.0,
+                alpha=0.72,
+                color=colours[pattern],
+            )
+        secondary_axis.set_ylabel(
+            "最大重影峰比 / Max ghost peak ratio",
+            fontsize=config.axis_label_font_size,
+        )
+        secondary_axis.tick_params(labelsize=config.tick_font_size)
+    _save_figure(
+        figure,
+        directory / config.slice_figure_filename,
+        config,
+        "固定 p、d 与 p/d 的重影切片 / Ghost slices at fixed p, d, and p/d",
+    )
+
+
+def save_design_comparison_figure(
+    config: ArrayGhostSimulationConfig,
+    metric_rows: Sequence[dict[str, Any]],
+    directory: Path,
+) -> None:
+    """A、B、C 三个文档设计点的风险指标对比。"""
+    patterns = ARRAY_PATTERN_KINDS
+    colours = _pattern_colours(config, patterns)
+    metric_specs = (
+        ("separation_to_width_ratio", "分离宽度比 / Separation-to-width"),
+        ("max_ghost_peak_ratio", "最大重影峰比 / Max ghost peak ratio"),
+        ("ghost_integrated_fraction", "主窗外能量 / Ghost energy fraction"),
+        ("ghost_count", "可见重影数 / Visible ghost count"),
+    )
+    figure, axes = plt.subplots(
+        2,
+        2,
+        figsize=config.design_figure_size_inches,
+        dpi=config.figure_dpi,
+        squeeze=False,
+    )
+    labels = config.design_point_labels
+    x_positions = np.arange(len(labels), dtype=np.float64)
+    bar_width = 0.8 / max(1, len(patterns))
+    for axis, (metric_name, metric_label) in zip(
+        axes.ravel(), metric_specs
+    ):
+        for pattern_index, pattern in enumerate(patterns):
+            values = []
+            for label in labels:
+                group_name = f"design_point_{label}"
+                matching = [
+                    row
+                    for row in metric_rows
+                    if row["comparison_group"] == group_name
+                    and str(row["pattern_kind"]) == pattern
+                ]
+                values.append(
+                    _row_float(matching[0], metric_name)
+                    if matching
+                    else math.nan
+                )
+            axis.bar(
+                x_positions
+                + (pattern_index - 0.5 * (len(patterns) - 1)) * bar_width,
+                values,
+                width=bar_width,
+                color=colours[pattern],
+                label=array_pattern_display_name(pattern),
+            )
+        axis.set_title(metric_label, fontsize=config.panel_title_font_size)
+        axis.set_xticks(x_positions, labels)
+        axis.set_xlabel(
+            "文档设计点 / Document design",
+            fontsize=config.axis_label_font_size,
+        )
+        axis.grid(axis="y", alpha=0.2)
+        axis.tick_params(labelsize=config.tick_font_size)
+    axes[0, 0].legend(
+        fontsize=config.legend_font_size,
+        ncol=1,
+        loc="best",
+    )
+    _save_figure(
+        figure,
+        directory / config.design_figure_filename,
+        config,
+        "设计点 A、B、C 的重影风险对比 / Design-point ghost-risk comparison",
+    )
+
+
+def save_validation_table_figure(
+    config: ArrayGhostSimulationConfig,
+    validation_rows: Sequence[dict[str, Any]],
+    directory: Path,
+) -> None:
+    """V-A 到 V-K 的完整验证表。"""
+    figure, axis = plt.subplots(
+        figsize=config.validation_figure_size_inches,
+        dpi=config.figure_dpi,
+    )
+    axis.axis("off")
+    character_limit = config.validation_table_character_limit
+
+    def shorten(value: Any) -> str:
+        text = str(value)
+        if len(text) <= character_limit:
+            return text
+        return text[: character_limit - 3] + "..."
+
+    def wrap_notes(value: Any) -> str:
+        return "\n".join(
+            textwrap.wrap(
+                str(value),
+                width=config.validation_table_notes_wrap_characters,
+                break_long_words=True,
+                break_on_hyphens=False,
+            )
+        )
+
+    headers = (
+        "锚点 / Anchor",
+        "检查 / Check",
+        "实测 / Measured",
+        "期望 / Expected",
+        "相对误差 / Rel. error",
+        "容差 / Tolerance",
+        "通过 / Pass",
+        "说明 / Notes",
+    )
+    table_rows = []
+    for row in validation_rows:
+        relative_error = float(row["relative_error_percent"])
+        relative_error_text = (
+            f"{relative_error:.4g}%"
+            if math.isfinite(relative_error)
+            else "n/a"
+        )
+        table_rows.append(
+            (
+                shorten(row["anchor_id"]),
+                shorten(row["description"]),
+                f"{float(row['measured']):.6g}",
+                f"{float(row['expected']):.6g}",
+                relative_error_text,
+                f"{float(row['tolerance_percent']):.4g}%"
+                if math.isfinite(float(row["tolerance_percent"]))
+                else "n/a",
+                "通过 / pass" if bool(row["passed"]) else "未通过 / fail",
+                wrap_notes(row["notes"]),
+            )
+        )
+    table = axis.table(
+        cellText=table_rows,
+        colLabels=headers,
+        bbox=(0.01, 0.02, 0.98, 0.92),
+        colWidths=config.validation_table_column_widths,
+        cellLoc="left",
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(config.table_font_size)
+    for (row_index, column_index), cell in table.get_celld().items():
+        cell.set_edgecolor("0.75")
+        if row_index == 0:
+            cell.set_facecolor("#4c566a")
+            cell.set_text_props(color="white", weight="bold")
+            continue
+        source_row = validation_rows[row_index - 1]
+        if column_index == 6:
+            cell.set_facecolor(
+                "#d8f3dc" if bool(source_row["passed"]) else "#ffd6d6"
+            )
+    _save_figure(
+        figure,
+        directory / config.validation_figure_filename,
+        config,
+        "V-A 到 V-K 验证汇总 / Validation summary V-A to V-K",
+    )
+
+
+def save_all_figures(
+    config: ArrayGhostSimulationConfig,
+    metric_rows: Sequence[dict[str, Any]],
+    validation_rows: Sequence[dict[str, Any]],
+    psf_cache: PinholePsfCache,
+    kernel_cache: SolarKernelCache,
+    directory: Path,
+) -> None:
+    """按方案第 9 节顺序生成全部主结论图，逐张关闭 figure。"""
+    save_array_pattern_figure(config, directory)
+    save_mask_figure(config, directory)
+    save_point_source_array_psf_figure(
+        config, metric_rows, psf_cache, directory
+    )
+    save_solar_ghost_comparison_figure(
+        config,
+        metric_rows,
+        psf_cache,
+        kernel_cache,
+        directory,
+    )
+    save_ring_count_comparison_figure(
+        config,
+        metric_rows,
+        psf_cache,
+        kernel_cache,
+        directory,
+    )
+    save_ghost_angle_heatmap_figure(config, metric_rows, directory)
+    save_diameter_pitch_relation_figure(config, metric_rows, directory)
+    save_pitch_diameter_slices_figure(config, metric_rows, directory)
+    save_design_comparison_figure(config, metric_rows, directory)
+    save_validation_table_figure(config, validation_rows, directory)
 
 
 def summarise_scan(
@@ -5082,11 +6665,15 @@ def main(argv: Sequence[str] | None = None) -> None:
         config, anchors, psf_cache, kernel_cache
     )
     ring_rows = build_ring_geometry_rows(config, anchors)
+    geometry_rows = build_geometry_rows(config)
     selection_rows = build_pattern_selection_rows(config, anchors)
     coarse_rows = build_coarse_check_rows(config, anchors)
     pareto_rows = compute_pareto_front(metric_rows)
     validation_rows = build_validation_rows(
         config, anchors, psf_cache, kernel_cache
+    )
+    solar_convergence_rows = build_solar_convergence_rows(
+        config, anchors, psf_cache
     )
     config_payload = build_config_payload(
         config, anchors, psf_cache, kernel_cache, gpu_name
@@ -5098,11 +6685,21 @@ def main(argv: Sequence[str] | None = None) -> None:
         metric_rows,
         peak_rows,
         ring_rows,
+        geometry_rows,
         selection_rows,
         coarse_rows,
         pareto_rows,
         validation_rows,
+        solar_convergence_rows,
         config_payload,
+    )
+    save_all_figures(
+        config,
+        metric_rows,
+        validation_rows,
+        psf_cache,
+        kernel_cache,
+        directory,
     )
     summarise_scan(config, metric_rows, validation_rows)
     print(

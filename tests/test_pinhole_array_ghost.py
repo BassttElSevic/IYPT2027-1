@@ -17,7 +17,9 @@ import numpy as np
 from pinhole_array_ghost import (
     accumulate_shifted_kernels,
     build_diameter_anchor_grid,
+    build_geometry_rows,
     build_psf_cache,
+    build_solar_convergence_rows,
     build_solar_directions,
     build_solar_disk_kernel,
     circle_overlap_area_mm2,
@@ -26,6 +28,7 @@ from pinhole_array_ghost import (
     classify_risk_labels,
     compute_ghost_metrics,
     compute_pareto_front,
+    configure_bilingual_plot_font,
     enumerate_scan_points,
     evaluate_scan_point,
     local_peak_arcmin,
@@ -55,7 +58,9 @@ from pinhole_array_ghost import (
     lattice_unit_cell_area_mm2,
     minimum_ring_radius_mm,
     rasterize_mask,
+    reference_diameter_mm,
     resolve_simulation_directory,
+    save_ghost_angle_heatmap_figure,
     write_csv,
     validate_config,
     validate_layout,
@@ -804,6 +809,17 @@ class AnchorReuseTest(unittest.TestCase):
             places=3,
         )
 
+    def test_retinal_anchor_matches_wavelength_readme_value(self) -> None:
+        config = ArrayGhostSimulationConfig()
+        anchors = load_previous_diameter_anchors(config)
+        diameter_mm, source = reference_diameter_mm(
+            config, anchors, 3.0, 400.0
+        )
+
+        # README：M = 3 D、400 nm 时第二阶段最优孔径约 0.542 mm。
+        self.assertAlmostEqual(diameter_mm, 0.542, places=3)
+        self.assertEqual(source, "retinal_optotype_wavelength")
+
     def test_anchor_grid_scales_around_reference(self) -> None:
         config = ArrayGhostSimulationConfig()
         anchors = load_previous_diameter_anchors(config)
@@ -1490,6 +1506,23 @@ class ScanOrchestrationTest(unittest.TestCase):
                     validate_layout(point.layout, self.config)["geometry_ok"]
                 )
 
+    def test_full_scan_includes_wavelength_study(self) -> None:
+        config = ArrayGhostSimulationConfig()
+        anchors = load_previous_diameter_anchors(config)
+        points = enumerate_scan_points(config, anchors)
+
+        self.assertEqual(len(points), 881)
+        wavelength_points = [
+            point
+            for point in points
+            if point.comparison_group == "wavelength_study"
+        ]
+        self.assertEqual(len(wavelength_points), 7)
+        self.assertEqual(
+            {point.wavelength_nm for point in wavelength_points},
+            set(config.spectral_wavelengths_nm),
+        )
+
     def test_metric_and_peak_rows_match_csv_contracts(self) -> None:
         psf_cache = build_psf_cache(self.config)
         kernel_cache = SolarKernelCache()
@@ -1589,6 +1622,78 @@ class ValidationAndOutputContractTest(unittest.TestCase):
             lines = path.read_text(encoding="utf-8").splitlines()
 
         self.assertEqual(lines, ["first,second", "1,2"])
+
+    def test_geometry_rows_cover_all_patterns_and_pass_qc(self) -> None:
+        config = ArrayGhostSimulationConfig().quick_variant()
+        rows = build_geometry_rows(config)
+
+        self.assertEqual(len(rows), 5)
+        self.assertEqual(
+            {row["pattern_kind"] for row in rows},
+            {
+                "square_packing",
+                "triangular_packing",
+                "hexagonal_packing",
+                "concentric_hexagonal_rings",
+                "concentric_circular_rings",
+            },
+        )
+        for row in rows:
+            with self.subTest(pattern=row["pattern_kind"]):
+                self.assertTrue(row["geometry_ok"])
+                self.assertTrue(row["mask_ok"])
+                self.assertLess(
+                    row["mask_relative_area_error_percent"],
+                    config.mask_area_relative_tolerance * 100.0,
+                )
+
+    def test_solar_convergence_dense_row_passes_both_checks(self) -> None:
+        config = ArrayGhostSimulationConfig().quick_variant()
+        anchors = load_previous_diameter_anchors(config)
+        psf_cache = build_psf_cache(config)
+        rows = build_solar_convergence_rows(config, anchors, psf_cache)
+
+        self.assertEqual(len(rows), 2)
+        dense_row = max(
+            rows, key=lambda row: int(row["direction_sample_count"])
+        )
+        self.assertTrue(dense_row["width_pass"])
+        self.assertTrue(dense_row["peak_pass"])
+
+    def test_ghost_heatmap_handles_singleton_diameter_axis(self) -> None:
+        configure_bilingual_plot_font()
+        config = replace(
+            ArrayGhostSimulationConfig().quick_variant(),
+            figure_dpi=80,
+            ghost_heatmap_figure_size_inches=(8.0, 5.0),
+        )
+        rows = []
+        for pattern_kind in (
+            "square_packing",
+            "triangular_packing",
+            "hexagonal_packing",
+        ):
+            for index, pitch_mm in enumerate((2.0, 4.0), start=1):
+                rows.append(
+                    {
+                        "comparison_group": "diameter_pitch_grid",
+                        "pattern_kind": pattern_kind,
+                        "diameter_mm": 0.6354,
+                        "pitch_mm": pitch_mm,
+                        "first_order_angle_arcmin": 275.0 * index,
+                        "separation_to_width_ratio": 12.0 * index,
+                    }
+                )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_path = (
+                Path(temporary_directory) / config.ghost_heatmap_figure_filename
+            )
+            save_ghost_angle_heatmap_figure(
+                config, rows, Path(temporary_directory)
+            )
+
+            self.assertTrue(output_path.exists())
+            self.assertGreater(output_path.stat().st_size, 0)
 
 
 class LayoutQualityTest(unittest.TestCase):
