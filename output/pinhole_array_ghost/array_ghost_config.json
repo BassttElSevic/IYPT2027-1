@@ -206,6 +206,7 @@
   "pitch_reference_values_mm": [
     2.0,
     2.5,
+    3.0,
     4.0,
     8.0
   ],
@@ -300,6 +301,7 @@
   "first_order_angle_tolerance_percent": 5.0,
   "energy_relative_tolerance_percent": 0.1,
   "mirror_symmetry_tolerance": 0.001,
+  "pair_center_null_tolerance": 0.01,
   "cache_recompute_tolerance": 1e-06,
   "exact_match_tolerance_percent": 1e-06,
   "solar_convergence_tolerance_percent": 2.0,
@@ -318,6 +320,14 @@
   "point_source_figure_size_inches": [
     30.0,
     22.0
+  ],
+  "retinal_scene_figure_size_inches": [
+    30.0,
+    20.0
+  ],
+  "retinal_pitch_scene_figure_size_inches": [
+    30.0,
+    20.0
   ],
   "solar_comparison_figure_size_inches": [
     30.0,
@@ -369,6 +379,15 @@
   ],
   "image_log_dynamic_range": 3.0,
   "image_colormap_name": "inferno",
+  "retinal_scene_colormap_name": "gray",
+  "retinal_scene_stroke_arcmin": 20.0,
+  "retinal_scene_optotype_width_factor": 5.0,
+  "retinal_scene_antialias_fraction": 0.75,
+  "retinal_scene_display_scale_fraction": 0.995,
+  "retinal_scene_min_half_width_factor": 3.25,
+  "retinal_scene_pattern_pupil_mm": 4.0,
+  "retinal_scene_pitch_diameter_mm": 0.9,
+  "retinal_scene_pitch_pupil_mm": 5.3,
   "pattern_colormap_name": "viridis",
   "heatmap_colormap_name": "magma",
   "ghost_heatmap_vmin": 0.0,
@@ -399,6 +418,8 @@
   "pattern_figure_filename": "array_patterns.png",
   "mask_figure_filename": "array_masks.png",
   "point_source_figure_filename": "point_source_array_psf.png",
+  "retinal_scene_figure_filename": "retinal_ghost_arrays.png",
+  "retinal_pitch_scene_figure_filename": "retinal_ghost_pitch.png",
   "solar_comparison_figure_filename": "solar_ghost_comparison.png",
   "ring_comparison_figure_filename": "ring_count_comparison.png",
   "ghost_heatmap_figure_filename": "ghost_angle_heatmap.png",
@@ -462,13 +483,13 @@
     ]
   },
   "cache_statistics": {
-    "psf_compute_count": 50,
-    "psf_hit_count": 4,
-    "kernel_compute_count": 50,
-    "kernel_hit_count": 832
+    "psf_compute_count": 53,
+    "psf_hit_count": 5,
+    "kernel_compute_count": 53,
+    "kernel_hit_count": 837
   },
-  "script_sha256": "0368f3e7383306fd51baf51de0cb68e8e92ee3a01a7be6ae1cbe340d193494a3",
-  "test_sha256": "8ea9f58b95b70403eadaa4dab1633d93f4a69a1c19473a94f92a7d2ed4ea74cb",
+  "script_sha256": "22ddc733d39556657d61853ad87eb753ef9700724b889cc7509480df20155dde",
+  "test_sha256": "ba47ee7d587b013d586b382edc401c8934e05b73066b89672f284c01ddbc370c",
   "single_hole_PSF.py_sha256": "dd784e45ab6862c16ad31d7a17d266ad96b3f6de61392e0c11eefb355fad88a3",
   "single_hole_retinal_image.py_sha256": "48aad6d2e131836f1e91115eec43117f53d4dc6b4048f885ee46d65286f786c2"
 }

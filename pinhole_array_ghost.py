@@ -39,8 +39,9 @@
 #
 # 范围锁定：
 # - 对话新增的主要求是：孔心排布、孔径 d、孔距 p、p/d 相对关系和重影机制。
-# - PDF 的任务③硬约束是：孔间非相干、重影角 p/f、太阳扩展源、
-#   单孔 PSF 平移平铺、重影分离可量化、输出可验证。
+# - PDF 的任务③硬约束是：孔间非相干、重影分离、太阳扩展源、
+#   单孔 PSF 平移平铺、重影可量化、输出可验证。初稿中的 p/f 数值
+#   口径已由临床多针孔证据和离焦波前推导修正为 Δθ = M p。
 # - PDF 的“六边形密排”在数学上是六近邻三角晶格；对话中要求的
 #   “六边形图案”另行定义为蜂窝顶点型三近邻阵列，二者都保留，
 #   但报告和配置中必须区分。
@@ -62,7 +63,7 @@
 # 术语约定：
 # - “孔的大小”和“孔径”在本阶段都指圆孔直径 d；
 # - “孔距”指相邻孔心距离 p；
-# - “二者的相对关系”主要记录为 p/d、d/p、p/f 和 d/f；
+# - “二者的相对关系”主要记录为 p/d、d/p、p/D_pupil 和 p/d 等；
 # - 如果有意研究椭圆孔、矩形孔或不同方向孔径，必须另设参数和新模型，
 #   不能把它们悄悄混进圆孔直径 d。
 #
@@ -83,12 +84,15 @@
 # ============================================================================
 #
 # 0.1 点源阵列响应
-# 设第 i 个孔心相对当前注视主孔的坐标为 r_i，针孔到视网膜等效距离为 f。
-# 同一个远处点源经不同孔进入眼睛后，各像点的角位移满足：
-#     Δθ_i = r_i / f
+# 设第 i 个孔心相对当前注视主孔的坐标为 r_i，眼睛的近视离焦为 M。
+# 把眼睛等效透镜后的离焦改写为瞳孔面上的二次相位后可知，横向平移
+# 一个子孔径等价于在离焦面引入一个一阶线性相位，因此孔位产生的
+# 相对角像移为：
+#     Δθ_i = -M r_i
 # 一阶相邻孔的间距大小为：
-#     Δθ_neighbor = p / f
-# 其中 p 是相邻孔距，f 使用第一步已有的 25 mm 等效距离口径。
+#     Δθ_neighbor = M p
+# 其中 r_i 和 p 使用米，M 使用屈光度。这里不能再使用 r_i / f：
+# 25 mm 是单孔模型中的针孔-视网膜等效距离，不是孔阵列的物距。
 #
 # 点源下的阵列 PSF 写成：
 #     PSF_array(θ) = Σ_i w_i PSF_single(θ - Δθ_i)
@@ -96,9 +100,9 @@
 # 产生孔间干涉条纹，并得到与太阳照明不符的结论。
 #
 # 必须先固定符号约定，再写任何平移代码：
-# - 定义孔心 r_i 的图像位移为 +r_i / f，或统一取负号；
+# - 定义孔心 r_i 的图像位移为 -M r_i，或统一取相反符号；
 # - 在全流程、测试、图注和 CSV 中使用同一个约定；
-# - 测试一个非中心单孔，断言峰值落在 p/f 对应的位置；
+# - 测试一个非中心单孔，断言峰值落在 M p 对应的位置；
 # - 不要一会儿平移 PSF、一会儿平移坐标轴，避免双重反向。
 #
 # 0.2 太阳扩展源
@@ -134,9 +138,9 @@
 # - 对每个 M 只保留 d_opt 及其小邻域，例如乘以 0.8, 0.9, 1.0, 1.1, 1.2；
 # - 保留一个低分辨率全范围对照组，只用于确认没有错过新最优区。
 #
-# 0.5 重影机制如何由 d、p 和 p/d 控制
-# 一阶重影的绝对角间隔只由孔距和等效焦距决定：
-#     Δθ_first = p / f
+# 0.5 重影机制如何由 M、d、p 和 p/d 控制
+# 一阶重影的绝对角间隔由离焦量和孔距共同决定：
+#     Δθ_first = M p
 # 单孔像本身的角宽度 W 由第一步 PSF 和太阳盘共同决定：
 #     W = W(d, M, λ, solar_diameter)
 # 因此重影是否看起来分离，不是只看 p，也不是只看 d，而是看：
@@ -144,7 +148,9 @@
 # 其中：
 # - d 主要控制单孔像的宽度。衍射区 W 随 d 增大而减小，
 #   离焦区 W 随 d 增大而增大，不能只写成一个固定比例。
-# - p 主要控制重影位置。p 越大，相邻重影角间隔 p/f 越大。
+# - p 主要控制重影位置。p 越大，相邻重影角间隔 M p 越大。
+# - M 同时放大孔间像移和单孔离焦模糊；M = 0 时理想聚焦眼睛的各
+#   子孔径像重新重合，不能仅凭孔距本身制造分离重影。
 # - p/d 是重要的无量纲尺度，但不足以单独决定结果。即使 p/d 不变，
 #   同时放大 d 和 p 也会改变绝对重影角、绝对 PSF 宽度、太阳盘融合程度
 #   和衍射/离焦所处区域。
@@ -162,9 +168,9 @@
 # 重影机制的最小指标集合：
 # - ghost_count：在视场和亮度门槛内的可识别峰数量；
 # - ghost_positions：每个峰相对主像的 (Δθ_x, Δθ_y)；
-# - first_order_angle：最邻近一阶峰的 p/f 角度；
+# - first_order_angle：最邻近一阶峰的 M p 角度；
 # - ghost_peak_ratio：每个重影峰相对主峰的强度；
-# - ghost_integrated_fraction：扣除主像窗口后的总能量占比；
+# - ghost_integrated_fraction：扣除参考孔后，其余孔贡献的通光占比；
 # - valley_visibility：相邻重影之间的谷值可见度；
 # - merge_ratio：峰间距除以太阳盘卷积后的像宽；
 # - pattern_signature：正方、三角、六边和环阵列各自的角向峰分布。
@@ -204,7 +210,8 @@
 #
 # 1.1 物理输入
 # - gpu_device_id、real_dtype、complex_dtype、accumulator_dtype；
-# - focal_length_mm：沿用第一步，默认 25 mm；
+# - focal_length_mm：沿用第一步的单孔针孔-视网膜等效距离，默认 25 mm；
+#   它不参与孔间重影角，孔间像移统一使用 Δθ = M r；
 # - primary_wavelength_nm：默认 550 nm；
 # - myopia_values_d：本阶段至少覆盖 0.5、1、2、3、4、6 D；
 # - diameter_reference_kind：retinal_optotype_primary 为主，psf_d50_crosscheck 为辅；
@@ -298,7 +305,7 @@
 # - 用一个孔对应一个正方形单元；
 # - x、y 方向相邻孔心距都为 p；
 # - 生成坐标可写为 (i * p, j * p)，i、j 取整数；
-# - 内部孔通常有 4 个最近邻，沿 x、y 的重影角间隔都是 p / f；
+# - 内部孔通常有 4 个最近邻，沿 x、y 的重影角间隔都是 M p；
 # - 面积分数解析值 T = (pi / 4) * (d / p)^2；
 # - 重点检查对角线方向的第二个近邻，其距离为 p * sqrt(2)，
 #   对应重影更强地落在斜方向上。
@@ -388,18 +395,18 @@
 # 跟踪至少五个量：
 # - 几何余量：edge_clearance = p - d；
 # - 面积分数：T(d, p, array_pattern_kind)；
-# - 重影间隔：Δθ ≈ p / f；
+# - 重影间隔：Δθ ≈ M p；
 # - 单孔模糊宽度：W(d, M, λ)，从第一步 D50 或第二步阈值读取；
 # - 分离充分度：R = Δθ / W，必要时再除以太阳角直径的影响。
 #
 # 固定一个变量时的预期趋势要在代码和图注中逐条验证：
-# - 固定 d 增大 p：T 下降，孔数可能减少，重影间隔 p / f 增大；
+# - 固定 d 和 M 增大 p：T 下降，孔数可能减少，重影间隔 M p 增大；
 #   若 p 超过视场覆盖约束，死区风险上升，因此不是越大越好。
 # - 固定 p 增大 d：T 上升，几何余量下降；大 d 在近视下会增加单孔模糊，
 #   使每个重影本身变大，分离充分度反而可能下降。
 # - 固定 d / p 同时放大 d 和 p：解析面积分数通常不变，但重影角增大，
 #   单孔模糊也随 d 变化；因此“固定填充率”并不等于“固定视觉结果”。
-# - 固定 p / f：重影角不变，但 d 独立决定 PSF 宽度，必须单独报告。
+# - 固定 M p：重影角不变，但 d 独立决定 PSF 宽度，必须单独报告。
 #
 # 至少输出三种切法的重影关系图，避免只画一个总热图：
 # 1. d-p 平面：
@@ -421,7 +428,7 @@
 #
 # 条件筛选和 Pareto 前沿：
 # - 硬约束：p > d + minimum_edge_clearance；
-# - 重影约束：p / f >= separation_ratio_threshold * W；
+# - 重影约束：M p >= separation_ratio_threshold * W；
 # - 瞳孔约束：p >= pupil_diameter；
 # - 覆盖约束：p <= geometric_dead_zone_limit，按具体晶格数值计算；
 # - 光学约束：d 的 PSF 和第二步模型阈值放在可接受范围；
@@ -431,10 +438,10 @@
 # - 多目标没有唯一最优解，必须给 Pareto 前沿，并用实际佩戴条件选点。
 #
 # 解析极限只用于解释，不用于替代数值：
-# - 几何离焦极限下 W ≈ M * d，因此 R ≈ p / (f * M * d)；
-# - 当 M、f 固定时，R 主要受 p / d 比控制；
+# - 几何离焦极限下 W ≈ M * d，因此 R ≈ (M p) / (M d) = p / d；
+# - 当 M 不为零时，单孔像移和单孔离焦模糊同比放大，R 主要受 p / d 比控制；
 # - 衍射主导时 W 随 λ / d 增大，单独提高 p / d 比可能仍无法分离；
-# - 太阳盘本身约 0.53°，因此即使 p / f 大于重影间隔，太阳像也可能融合；
+# - 太阳盘本身约 0.53°，因此即使 M p 大于重影间隔，太阳像也可能融合；
 # - 分离条件应使用太阳盘卷积后的谷值，而不是只看两个点峰位置。
 #
 # ============================================================================
@@ -501,9 +508,9 @@
 # ============================================================================
 #
 # 5.1 为什么不能只建一张超大图
-# p = 8 mm、f = 25 mm 时，一阶重影约为 18.3°。若用 0.05 角分像素覆盖
-# 正负 20°，单张二维图会超过 2 万像素见方，和第二步的 2048 网格不在同
-# 一个量级。不要靠一张巨图解决所有问题。
+# p = 8 mm、M = 6 D 时，一阶重影约为 2.75°；若阵列最外孔仍位于瞳孔
+# 接受范围内，总跨度可达到数度至十余度。0.05 角分像素覆盖这个大视场
+# 会产生超大数组，因此仍需区分总览网格与局部高分辨网格。
 #
 # 5.2 推荐的三种 grid
 # - geometry_grid：
@@ -516,7 +523,7 @@
 #   只覆盖一个太阳盘叠加重影的局部区域，用足够细的太阳样本做积分验证。
 #
 # 5.3 平移放置规则
-# - 平移量在连续角坐标中计算：shift = r_i / f；
+# - 平移量在连续角坐标中计算：shift = M r_i；
 # - 通过目标角坐标到源 PSF 像素坐标的显式映射采样；
 # - 源中心必须严格映射到目标平移后的中心，不能在重采样中再产生半像素偏移；
 # - 非整数像素位置要用线性或三次插值，并把插值阶数写入配置；
@@ -540,9 +547,9 @@
 # ============================================================================
 #
 # 6.1 点源模式
-# - 只用 θ = 0 的单点，用于验证 Δθ = r_i / f；
+# - 只用 θ = 0 的单点，用于验证 Δθ = M r_i；
 # - 输出每个孔对应的峰值位置，而不是只看总图；
-# - 一阶相邻孔的重影角与 p / f 做解析对照；
+# - 一阶相邻孔的重影角与 M p 做解析对照；
 # - 这个模式应得到清晰、可数、位置准确的离散峰。
 #
 # 6.2 太阳盘模式
@@ -577,14 +584,14 @@
 # - ghost_vector_arcmin：每个孔相对参考主孔的 (Δθ_x, Δθ_y)；
 # - neighbor_ghost_angle_arcmin：相邻孔的最大或平均角间隔；
 # - neighbor_ghost_angle_deg；
-# - theory_ghost_angle = p / f，使用与仿真完全相同的 f；
+# - theory_ghost_angle = M p，使用与仿真完全相同的离焦模型；
 # - ghost_angle_error_percent；
 # - first_order_ghost_count 和 unique_overlap_count。
 #
 # 7.2 亮度与分离指标
 # - main_peak_normalized：参考主像峰值归一为 1；
 # - ghost_peak_normalized：各局部的最大重影峰值；
-# - ghost_integrated_fraction：扣除主像窗口后，重影窗口内的能量占比；
+# - ghost_integrated_fraction：由非参考孔贡献的通光占比；
 # - sun_image_width_arcmin：单孔或参考主像经太阳盘卷积后的等效宽度；
 # - separation_to_width_ratio = ghost_angle / sun_image_width；
 # - valley_visibility = (I_low - I_valley) / (I_low + I_valley)，
@@ -618,7 +625,7 @@
 # - 用 2x2 与 3x3 方格验证一阶和二阶重影位置；
 # - 用最小三角密铺和最小六边蜂窝验证最近邻方向数；
 # - 用中心孔加一圈验证 6 个一阶重影的角向分布；
-# - 用解析 p / f 对照全部孔心的重影位置；
+# - 用解析 M p 对照全部孔心的重影位置；
 # - 不运行 GPU 大扫描。
 #
 # 8.2 第二阶段：单色 550 nm、M = 3 D
@@ -640,7 +647,7 @@
 #
 # 8.3.1 d-p 关系扫描
 # - 先对每种排布分别做 d-p 合法性矩阵；
-# - 对每个合法点计算 edge_clearance、T、p / f、W 和 R；
+# - 对每个合法点计算 edge_clearance、T、M p、W 和 R；
 # - 输出固定 p、固定 d、固定 d / p 三组切片；
 # - 对每个 (layout, pupil_diameter, M) 生成一张 d-p 风险图；
 # - 再选出 pareto_front_diameter_pitch.csv，而不是人工挑一组“最好”。
@@ -678,6 +685,12 @@
 # - array_patterns.png：正方形、三角形、六边形和同心环孔心图；
 # - array_masks.png：不同主模式的抗锯齿掩膜；
 # - point_source_array_psf.png：点源阵列 PSF，标出一阶/二阶重影；
+# - retinal_ghost_arrays.png：有限瞳孔下五种排布的 E 视标主像与重影，
+#   用于比较排布方向和有效重影数量；
+# - retinal_ghost_pitch.png：固定排布和孔径时，孔距扫描对应的 E 视标
+#   重影分离、相对亮度和有限瞳孔筛选结果；
+# - point_source_array_psf.png：只作系统响应诊断，不解释为观察者
+#   最终看到的重影画面；
 # - solar_ghost_comparison.png：正方形、三角形、六边形和同心环的结果；
 # - ring_count_comparison.png：中心孔加 1、2、3、4 圈的重影演化；
 # - ghost_angle_heatmap.png：重影间距和分离比热图；
@@ -701,8 +714,8 @@
 # - 连通域数必须等于设计孔数。
 #
 # V-B 平移与重影角
-# - 单个非中心孔的峰值角位置与 r_i / f 的误差 < 2%；
-# - 一阶相邻孔重影角与 p / f 的误差 < 5%，加密后争取 < 2%；
+# - 单个非中心孔的峰值角位置与 M r_i 的误差 < 2%；
+# - 一阶相邻孔重影角与 M p 的误差 < 5%，加密后争取 < 2%；
 # - x、y 两个方向分别检查，不能只看径向距离。
 #
 # V-C 非相干叠加
@@ -717,7 +730,7 @@
 #
 # V-E 双孔解析
 # - 对称双孔应得到关于主像中心对称的一对等亮重影；
-# - 平移其中一个孔后，两个峰的位置应按 r / f 变化；
+# - 平移其中一个孔后，两个峰的位置应按 M r 变化；
 # - 其中一个孔权重减半后，对应峰值也应减半。
 #
 # V-F 能量
@@ -747,11 +760,11 @@
 #
 # V-J p-d 耦合
 # - edge_clearance = p - d 必须不小于配置值；
-# - 固定 d 时，p 增大应使解析重影角 p / f 单调增大；
+# - 固定 d 和 M 时，p 增大应使解析重影角 M p 单调增大；
 # - 固定 p 时，d 增大应使解析面积分数单调增大，同时几何余量下降；
 # - 固定 d / p 时，若 array_pattern_kind 不变，解析 T 应基本保持不变；
 # - 所有趋势都要使用同一个 f、同一个 p、同一个 d 和同一个 array_pattern_kind；
-# - 对至少三个点手算 T、p / f 和 edge_clearance 与 CSV 对照。
+# - 对至少三个点手算 T、M p 和 edge_clearance 与 CSV 对照。
 #
 # V-K 前两阶段孔径结论复用
 # - 每个 M 的主锚点必须来自第二步 retinal_optotype 结果；
@@ -773,7 +786,7 @@
 # 5. concentric_circular_rings 的孔数和角步进测试；
 # 6. 所有排布的最小间距和 edge_clearance 测试；
 # 7. 圆孔覆盖度圆心为 1、外部为 0、边缘连续测试；
-# 8. 两个孔的合成峰位置和 p / f 理论一致；
+# 8. 两个孔的合成峰位置和 M p 理论一致；
 # 9. 非中心单孔平移后峰值位置正确；
 # 10. 平移前后总能量守恒；
 # 11. 非相干累加不产生复振幅干涉；
@@ -943,6 +956,7 @@ from single_hole_PSF import (
     radial_bin_sum,
     theoretical_optimal_diameter_mm,
 )
+from single_hole_retinal_image import build_e_optotype
 
 
 # 五种主排布的名称契约。它们是字符串标识，不是可调物理量；
@@ -1060,7 +1074,9 @@ class ArrayGhostSimulationConfig:
     circular_ring_holes_per_ring: tuple[int, ...] = (6, 12, 18, 24)
     circular_ring_radial_pitch_mm: float = 2.0
     circular_ring_rotation_step_deg: float = 15.0
-    pitch_reference_values_mm: tuple[float, ...] = (2.0, 2.5, 4.0, 8.0)
+    # 2.0、3.0 mm 覆盖常见多针孔镜孔距，4.0、8.0 mm 用于检查
+    # 瞳孔内只剩单孔时的截止行为。
+    pitch_reference_values_mm: tuple[float, ...] = (2.0, 2.5, 3.0, 4.0, 8.0)
     minimum_pitch_mm: float = 1.5
     maximum_pitch_mm: float = 8.0
     pitch_log_count: int = 9
@@ -1151,6 +1167,7 @@ class ArrayGhostSimulationConfig:
     first_order_angle_tolerance_percent: float = 5.0
     energy_relative_tolerance_percent: float = 0.1
     mirror_symmetry_tolerance: float = 1.0e-3
+    pair_center_null_tolerance: float = 1.0e-2
     cache_recompute_tolerance: float = 1.0e-6
     exact_match_tolerance_percent: float = 1.0e-6
     solar_convergence_tolerance_percent: float = 2.0
@@ -1163,6 +1180,8 @@ class ArrayGhostSimulationConfig:
     pattern_figure_size_inches: tuple[float, float] = (28.0, 20.0)
     mask_figure_size_inches: tuple[float, float] = (28.0, 20.0)
     point_source_figure_size_inches: tuple[float, float] = (30.0, 22.0)
+    retinal_scene_figure_size_inches: tuple[float, float] = (30.0, 20.0)
+    retinal_pitch_scene_figure_size_inches: tuple[float, float] = (30.0, 20.0)
     solar_comparison_figure_size_inches: tuple[float, float] = (30.0, 23.0)
     ring_comparison_figure_size_inches: tuple[float, float] = (30.0, 22.0)
     ghost_heatmap_figure_size_inches: tuple[float, float] = (30.0, 20.0)
@@ -1192,6 +1211,20 @@ class ArrayGhostSimulationConfig:
     )
     image_log_dynamic_range: float = 3.0
     image_colormap_name: str = "inferno"
+    retinal_scene_colormap_name: str = "gray"
+    # 实拍多针孔镜的文字和视标不会被拆成许多颗独立“复眼小图”。为避免
+    # 用很小的视标放大孔间位移，主重影图使用 20 arcmin 笔画；此时
+    # M=3 D、p=2 mm 的一个 M p 位移约为一个笔画宽度。
+    retinal_scene_stroke_arcmin: float = 20.0
+    retinal_scene_optotype_width_factor: float = 5.0
+    retinal_scene_antialias_fraction: float = 0.75
+    retinal_scene_display_scale_fraction: float = 0.995
+    retinal_scene_min_half_width_factor: float = 3.25
+    retinal_scene_pattern_pupil_mm: float = 4.0
+    # 孔距图采用临床多针孔镜的典型孔径，和 5.3 mm 瞳孔、3 mm 孔距配套。
+    retinal_scene_pitch_diameter_mm: float = 0.9
+    # Kim et al. 2017 的临床多针孔镜平均瞳孔约 5.3 mm。
+    retinal_scene_pitch_pupil_mm: float = 5.3
     pattern_colormap_name: str = "viridis"
     heatmap_colormap_name: str = "magma"
     ghost_heatmap_vmin: float = 0.0
@@ -1224,6 +1257,8 @@ class ArrayGhostSimulationConfig:
     pattern_figure_filename: str = "array_patterns.png"
     mask_figure_filename: str = "array_masks.png"
     point_source_figure_filename: str = "point_source_array_psf.png"
+    retinal_scene_figure_filename: str = "retinal_ghost_arrays.png"
+    retinal_pitch_scene_figure_filename: str = "retinal_ghost_pitch.png"
     solar_comparison_figure_filename: str = "solar_ghost_comparison.png"
     ring_comparison_figure_filename: str = "ring_count_comparison.png"
     ghost_heatmap_figure_filename: str = "ghost_angle_heatmap.png"
@@ -1368,6 +1403,27 @@ def validate_config(config: ArrayGhostSimulationConfig) -> None:
         ),
         "figure_tight_layout_h_pad": config.figure_tight_layout_h_pad,
         "figure_tight_layout_w_pad": config.figure_tight_layout_w_pad,
+        "retinal_scene_stroke_arcmin": config.retinal_scene_stroke_arcmin,
+        "pair_center_null_tolerance": config.pair_center_null_tolerance,
+        "retinal_scene_optotype_width_factor": (
+            config.retinal_scene_optotype_width_factor
+        ),
+        "retinal_scene_antialias_fraction": (
+            config.retinal_scene_antialias_fraction
+        ),
+        "retinal_scene_display_scale_fraction": (
+            config.retinal_scene_display_scale_fraction
+        ),
+        "retinal_scene_min_half_width_factor": (
+            config.retinal_scene_min_half_width_factor
+        ),
+        "retinal_scene_pattern_pupil_mm": (
+            config.retinal_scene_pattern_pupil_mm
+        ),
+        "retinal_scene_pitch_diameter_mm": (
+            config.retinal_scene_pitch_diameter_mm
+        ),
+        "retinal_scene_pitch_pupil_mm": config.retinal_scene_pitch_pupil_mm,
         "heatmap_singleton_extent_fraction": (
             config.heatmap_singleton_extent_fraction
         ),
@@ -1392,6 +1448,24 @@ def validate_config(config: ArrayGhostSimulationConfig) -> None:
         raise ValueError("visibility_peak_threshold must be positive")
     if not 0.0 < config.scatter_marker_alpha <= 1.0:
         raise ValueError("scatter_marker_alpha must lie in (0, 1]")
+    if not 0.0 < config.retinal_scene_display_scale_fraction <= 1.0:
+        raise ValueError(
+            "retinal_scene_display_scale_fraction must lie in (0, 1]"
+        )
+    if config.retinal_scene_min_half_width_factor <= 0.0:
+        raise ValueError(
+            "retinal_scene_min_half_width_factor must be positive"
+        )
+    if config.retinal_scene_optotype_width_factor <= 0.0:
+        raise ValueError(
+            "retinal_scene_optotype_width_factor must be positive"
+        )
+    if config.retinal_scene_pattern_pupil_mm <= 0.0:
+        raise ValueError("retinal_scene_pattern_pupil_mm must be positive")
+    if config.retinal_scene_pitch_diameter_mm <= 0.0:
+        raise ValueError("retinal_scene_pitch_diameter_mm must be positive")
+    if config.retinal_scene_pitch_pupil_mm <= 0.0:
+        raise ValueError("retinal_scene_pitch_pupil_mm must be positive")
     if config.validation_table_character_limit < 8:
         raise ValueError("validation_table_character_limit must be at least 8")
     if config.validation_table_notes_wrap_characters < 8:
@@ -3021,6 +3095,7 @@ def plan_field_grid(
     image_width_arcmin: float,
     config: ArrayGhostSimulationConfig,
     kernel_half_width_arcmin: float | None = None,
+    minimum_half_width_arcmin: float | None = None,
 ) -> dict[str, Any]:
     """随视场大小和单孔像宽度自适应选择视场网格。
 
@@ -3045,6 +3120,11 @@ def plan_field_grid(
         + kernel_half_width_arcmin
         + config.field_extra_margin_arcmin
     )
+    if minimum_half_width_arcmin is not None:
+        half_width_arcmin = max(
+            half_width_arcmin,
+            minimum_half_width_arcmin,
+        )
     required_pixel_arcmin = (
         image_width_arcmin / config.field_min_pixels_per_image_width
         if image_width_arcmin > 0.0
@@ -3149,6 +3229,74 @@ def compute_hole_weights(
     return weights, "quasi_static_pupil"
 
 
+def defocus_hole_shifts_arcmin(
+    centers_mm: Any,
+    myopia_d: float,
+) -> np.ndarray:
+    """把孔心坐标换算为离焦视网膜上的相对像移。
+
+    对近视 M、孔心横向偏移 r 的小视场系统，离焦波前中的一阶项使
+    子孔径像产生 Δθ = -M r 的角位移。M 用屈光度、r 用毫米时，先
+    把 r 换成米，再乘 ARCMINUTES_PER_RADIAN 就得到角分。
+    """
+    return (
+        -np.asarray(centers_mm, dtype=np.float64)
+        * myopia_d
+        * METRES_PER_MILLIMETRE
+        * ARCMINUTES_PER_RADIAN
+    )
+
+
+def defocus_first_order_angle_arcmin(
+    pitch_mm: float,
+    myopia_d: float,
+) -> float:
+    """相邻孔心距 p 在近视离焦下的一阶重影角 |M p|。"""
+    return abs(
+        pitch_mm
+        * myopia_d
+        * METRES_PER_MILLIMETRE
+        * ARCMINUTES_PER_RADIAN
+    )
+
+
+def defocus_geometric_blur_arcmin(
+    diameter_mm: float,
+    myopia_d: float,
+) -> float:
+    """离焦时单孔几何弥散直径的角尺度 |M d|。"""
+    return abs(
+        diameter_mm
+        * myopia_d
+        * METRES_PER_MILLIMETRE
+        * ARCMINUTES_PER_RADIAN
+    )
+
+
+def minimum_nonzero_shift_distance_arcmin(
+    shifts_arcmin: Any,
+    weights: Any,
+    tolerance: float,
+) -> float:
+    """返回有效孔心中最小的非零像移距离。
+
+    多个重影在扩展视标上可以彼此重叠，不能再用图像聚类峰反推几何孔距。
+    这里直接使用已经按离焦模型换算的孔心位移，聚类只用于判断实际可分辨
+    峰数量。
+    """
+    centers = np.asarray(shifts_arcmin, dtype=np.float64)
+    weights_np = np.asarray(weights, dtype=np.float64)
+    active = weights_np > tolerance
+    centers = centers[active]
+    if centers.shape[0] < 2:
+        return math.nan
+    differences = centers[:, None, :] - centers[None, :, :]
+    distances = np.sqrt((differences**2).sum(axis=2))
+    distances[distances <= tolerance] = math.inf
+    minimum = float(distances.min())
+    return minimum if math.isfinite(minimum) else math.nan
+
+
 def accumulate_shifted_kernels(
     kernel: Any,
     kernel_pixel_arcmin: float,
@@ -3159,7 +3307,8 @@ def accumulate_shifted_kernels(
 ) -> dict[str, Any]:
     """把同一个单孔像核平移到每个孔位置并按强度累加。
 
-    这是方案 0.1 节的强度叠加：PSF_array = sum_i w_i * PSF_single(r - r_i/f)，
+    这是方案 0.1 节的强度叠加：
+    PSF_array = sum_i w_i * PSF_single(r + M r_i)，
     绝不出现复振幅求和。
     """
     field_size = int(field["grid_size"])
@@ -3173,8 +3322,8 @@ def accumulate_shifted_kernels(
     )
     axis = cp.arange(field_size, dtype=cp.float32) - field_size // 2
     field_y, field_x = cp.meshgrid(axis, axis, indexing="ij")
-    # 居中坐标 -> 数组下标：加中心偏移。平移量为负号方向，保持与
-    # PSF_array(theta) = sum_i PSF_single(theta - r_i / f) 的定义一致。
+    # 居中坐标 -> 数组下标：加中心偏移。平移量保持与
+    # PSF_array(theta) = sum_i PSF_single(theta + M r_i) 的定义一致。
     centre_index = field_size // 2
     accumulated = cp.zeros(
         (field_size, field_size), dtype=config.accumulator_dtype
@@ -3430,7 +3579,8 @@ def valley_visibility_between_peaks(
     valley = float(interior.min())
     if lower_peak + valley <= 0.0:
         return math.nan, "zero_signal"
-    return (lower_peak - valley) / (lower_peak + valley), "numeric"
+    visibility = (lower_peak - valley) / (lower_peak + valley)
+    return min(1.0, max(0.0, visibility)), "numeric"
 
 
 def compute_image_autocorrelation_metrics(
@@ -3601,8 +3751,10 @@ def compute_ghost_metrics(
         row for row in ghost_rows if row["above_visibility_threshold"]
     ]
 
-    first_order_angle_arcmin = (
-        min((row["ghost_radius_arcmin"] for row in ghost_rows), default=math.nan)
+    first_order_angle_arcmin = minimum_nonzero_shift_distance_arcmin(
+        shifts_arcmin,
+        weights,
+        config.floating_comparison_tolerance,
     )
     max_peak_ratio = max(
         (row["peak_ratio"] for row in ghost_rows), default=0.0
@@ -3613,7 +3765,29 @@ def compute_ghost_metrics(
         else math.nan
     )
 
-    # 主像窗口外的能量占比。
+    # 非参考孔贡献的通光占比。
+    active_indices = np.flatnonzero(
+        np.asarray(weights, dtype=np.float64)
+        > config.floating_comparison_tolerance
+    )
+    active_weights = np.asarray(weights, dtype=np.float64)[active_indices]
+    total_weight = float(active_weights.sum())
+    reference_weight = 0.0
+    if active_indices.size > 0:
+        active_centers = np.asarray(shifts_arcmin, dtype=np.float64)[
+            active_indices
+        ]
+        reference_local_index = int(
+            np.argmin((active_centers**2).sum(axis=1))
+        )
+        reference_weight = float(active_weights[reference_local_index])
+    ghost_integrated_fraction = (
+        1.0 - reference_weight / total_weight
+        if total_weight > 0.0 and math.isfinite(first_order_angle_arcmin)
+        else 0.0
+    )
+
+    # 主像窗口外的数值能量仍保留作旁证，不用于重影占比。
     grid_size = int(image.shape[0])
     centre_index = grid_size // 2
     coordinate = cp.arange(grid_size, dtype=cp.float32) - centre_index
@@ -3624,7 +3798,7 @@ def compute_ghost_metrics(
     outside_mask = cp.sqrt(grid_x**2 + grid_y**2) > window_radius_px
     total_energy = float(image.sum(dtype=config.accumulator_dtype))
     outside_energy = float(image[outside_mask].sum(dtype=config.accumulator_dtype))
-    ghost_integrated_fraction = (
+    outside_energy_fraction = (
         outside_energy / total_energy if total_energy > 0.0 else math.nan
     )
 
@@ -3678,6 +3852,7 @@ def compute_ghost_metrics(
         ),
         "max_ghost_peak_ratio": max_peak_ratio,
         "ghost_integrated_fraction": ghost_integrated_fraction,
+        "outside_main_window_fraction": outside_energy_fraction,
         "sun_image_width_arcmin": image_width_arcmin,
         "separation_to_width_ratio": separation_to_width_ratio,
         "valley_visibility": valley_visibility,
@@ -4068,6 +4243,8 @@ GHOST_METRIC_FIELDS: tuple[str, ...] = (
     "diameter_mm",
     "pitch_mm",
     "pitch_to_diameter_ratio",
+    "pupil_to_pitch_ratio",
+    "defocus_blur_arcmin",
     "edge_clearance_mm",
     "pupil_diameter_mm",
     "weight_model",
@@ -4086,6 +4263,7 @@ GHOST_METRIC_FIELDS: tuple[str, ...] = (
     "first_order_angle_error_percent",
     "max_ghost_peak_ratio",
     "ghost_integrated_fraction",
+    "outside_main_window_fraction",
     "sun_image_width_arcmin",
     "separation_to_width_ratio",
     "valley_visibility",
@@ -4140,10 +4318,9 @@ def evaluate_scan_point(
     weights_np, weight_model = compute_hole_weights(
         point.layout, point.pupil_diameter_mm, weight_config
     )
-    shifts_np = (
-        point.layout.centers_mm
-        / config.focal_length_mm
-        * ARCMINUTES_PER_RADIAN
+    shifts_np = defocus_hole_shifts_arcmin(
+        point.layout.centers_mm,
+        point.myopia_d,
     )
     shifts = cp.asarray(shifts_np, dtype=cp.float32)
     weights = cp.asarray(weights_np, dtype=config.accumulator_dtype)
@@ -4156,8 +4333,9 @@ def evaluate_scan_point(
         field,
         config,
     )
-    theory_first_order_angle_arcmin = (
-        point.pitch_mm / config.focal_length_mm * ARCMINUTES_PER_RADIAN
+    theory_first_order_angle_arcmin = defocus_first_order_angle_arcmin(
+        point.pitch_mm,
+        point.myopia_d,
     )
     metrics, ghost_rows, _clusters = compute_ghost_metrics(
         image_result,
@@ -4186,6 +4364,13 @@ def evaluate_scan_point(
         "diameter_mm": point.diameter_mm,
         "pitch_mm": point.pitch_mm,
         "pitch_to_diameter_ratio": point.pitch_mm / point.diameter_mm,
+        "pupil_to_pitch_ratio": (
+            point.pupil_diameter_mm / point.pitch_mm
+        ),
+        "defocus_blur_arcmin": defocus_geometric_blur_arcmin(
+            point.diameter_mm,
+            point.myopia_d,
+        ),
         "pupil_diameter_mm": point.pupil_diameter_mm,
         "weight_model": weight_model,
         "reference_weight": image_result["reference_weight"],
@@ -4269,7 +4454,7 @@ PATTERN_SELECTION_FIELDS: tuple[str, ...] = (
     "pattern_kind",
     "pitch_mm",
     "pitch_to_diameter_ratio",
-    "pitch_to_focal_length",
+    "first_order_ghost_angle_arcmin",
     "geometry_ok",
     "topology_ok",
 )
@@ -4306,8 +4491,12 @@ def build_pattern_selection_rows(
                         "diameter_mm": diameter_mm,
                         "pitch_mm": pitch_mm,
                         "pitch_to_diameter_ratio": pitch_mm / diameter_mm,
-                        "pitch_to_focal_length": pitch_mm
-                        / config.focal_length_mm,
+                        "first_order_ghost_angle_arcmin": (
+                            defocus_first_order_angle_arcmin(
+                                pitch_mm,
+                                myopia_d,
+                            )
+                        ),
                         "geometry_ok": qc["geometry_ok"],
                         "topology_ok": qc["topology_ok"],
                     }
@@ -4351,8 +4540,12 @@ def build_coarse_check_rows(
                         "diameter_factor_vs_anchor": factor,
                         "pitch_mm": pitch_mm,
                         "pitch_to_diameter_ratio": pitch_mm / diameter_mm,
-                        "pitch_to_focal_length": pitch_mm
-                        / config.focal_length_mm,
+                        "first_order_ghost_angle_arcmin": (
+                            defocus_first_order_angle_arcmin(
+                                pitch_mm,
+                                myopia_d,
+                            )
+                        ),
                         "edge_clearance_mm": pitch_mm - diameter_mm,
                         "analytic_area_fraction": area_fraction,
                         "geometry_ok": (
@@ -4661,7 +4854,7 @@ PATTERN_SELECTION_FULL_FIELDS: tuple[str, ...] = (
     "diameter_mm",
     "pitch_mm",
     "pitch_to_diameter_ratio",
-    "pitch_to_focal_length",
+    "first_order_ghost_angle_arcmin",
     "geometry_ok",
     "topology_ok",
 )
@@ -4772,16 +4965,18 @@ def build_validation_rows(
     kernel, image_width_arcmin, _metadata = kernel_cache.get(
         config, psf_cache, diameter_mm, myopia_d, config.primary_wavelength_nm
     )
-    theory_first_order_angle_arcmin = (
-        pitch_mm / config.focal_length_mm * ARCMINUTES_PER_RADIAN
+    theory_first_order_angle_arcmin = defocus_first_order_angle_arcmin(
+        pitch_mm,
+        myopia_d,
     )
 
     # V-B 平移与重影角，V-E 双孔解析，V-F 能量。
     layout = build_layout_for_pattern(
         config, ARRAY_PATTERN_SQUARE_PACKING, pitch_mm, diameter_mm, ring_count=1
     )
-    shifts_np = (
-        layout.centers_mm / config.focal_length_mm * ARCMINUTES_PER_RADIAN
+    shifts_np = defocus_hole_shifts_arcmin(
+        layout.centers_mm,
+        myopia_d,
     )
     weights_np, _weight_model = compute_hole_weights(layout, None, config)
     shifts = cp.asarray(shifts_np, dtype=cp.float32)
@@ -4807,7 +5002,7 @@ def build_validation_rows(
     rows.append(
         _validation_row(
             "V-B-first-order-angle",
-            "first-order ghost angle vs p / f",
+            "first-order ghost angle vs M p",
             metrics["first_order_angle_arcmin"],
             theory_first_order_angle_arcmin,
             config.first_order_angle_tolerance_percent,
@@ -4851,14 +5046,41 @@ def build_validation_rows(
     pair_centers_mm = np.asarray(
         [[-0.5 * pitch_mm, 0.0], [0.5 * pitch_mm, 0.0]], dtype=np.float64
     )
-    pair_shifts_np = (
-        pair_centers_mm / config.focal_length_mm * ARCMINUTES_PER_RADIAN
+    pair_shifts_np = defocus_hole_shifts_arcmin(
+        pair_centers_mm,
+        myopia_d,
     )
     pair_shifts = cp.asarray(pair_shifts_np, dtype=cp.float32)
     pair_weights = cp.ones((2,), dtype=config.accumulator_dtype)
-    pair_field = plan_field_grid(pair_shifts, image_width_arcmin, config)
+    # V-E 检查理想点源下的双孔对称性，必须使用单孔点扩散函数。
+    # 太阳盘卷积核宽约 22.5 arcmin，会掩盖 20.6 arcmin 的双孔分离，
+    # 把两端重影融回中心；那是扩展源效应，不是平移极性或双孔几何错误。
+    pair_psf, pair_sampling = psf_cache.get(
+        config,
+        diameter_mm,
+        myopia_d,
+        config.primary_wavelength_nm,
+    )
+    pair_kernel = resample_psf_to_grid(
+        pair_psf,
+        pair_sampling.angular_pixel_arcmin,
+        config.effective_analysis_grid_size(),
+        config.analysis_pixel_arcmin,
+        config,
+    )
+    pair_image_width_arcmin = measure_image_width_arcmin(
+        pair_kernel,
+        config.analysis_pixel_arcmin,
+        config.sun_width_energy_fraction,
+        config,
+    )
+    pair_field = plan_field_grid(
+        pair_shifts,
+        pair_image_width_arcmin,
+        config,
+    )
     pair_result = accumulate_shifted_kernels(
-        kernel,
+        pair_kernel,
         config.analysis_pixel_arcmin,
         pair_shifts,
         pair_weights,
@@ -4870,7 +5092,7 @@ def build_validation_rows(
     rows.append(
         _validation_row(
             "V-E-two-hole-separation",
-            "symmetric two-hole pair separation vs p / f",
+            "symmetric two-hole pair separation vs M p",
             pair_separation,
             theory_first_order_angle_arcmin,
             config.first_order_angle_tolerance_percent,
@@ -4890,7 +5112,7 @@ def build_validation_rows(
                 "midpoint value must be far below the two ghost peaks; "
                 f"peak={float(pair_image.max()):.6g}"
             ),
-            tolerance_absolute=config.visibility_peak_threshold,
+            tolerance_absolute=config.pair_center_null_tolerance,
         )
     )
 
@@ -5066,7 +5288,7 @@ def build_validation_rows(
     # V-J p-d 耦合趋势。
     coarse_pitches = build_pitch_grid(config, diameter_mm)
     angles = [
-        value / config.focal_length_mm * ARCMINUTES_PER_RADIAN
+        defocus_first_order_angle_arcmin(value, myopia_d)
         for value in coarse_pitches
     ]
     monotone = all(a < b for a, b in zip(angles, angles[1:]))
@@ -5325,7 +5547,7 @@ def write_all_outputs(
         "diameter_factor_vs_anchor",
         "pitch_mm",
         "pitch_to_diameter_ratio",
-        "pitch_to_focal_length",
+        "first_order_ghost_angle_arcmin",
         "edge_clearance_mm",
         "analytic_area_fraction",
         "geometry_ok",
@@ -5441,12 +5663,31 @@ def _representative_layout(
     )
 
 
+def _weight_config_for_row(
+    config: ArrayGhostSimulationConfig,
+    row: dict[str, Any],
+) -> ArrayGhostSimulationConfig:
+    """重建扫描点时必须沿用该点实际采用的瞳孔权重模型。"""
+    if str(row.get("weight_model", "")) != "quasi_static_pupil":
+        return config
+    return replace(
+        config,
+        enable_pupil_vignetting=True,
+        pupil_plane_distance_mm=(
+            config.pupil_plane_distance_mm
+            if config.pupil_plane_distance_mm is not None
+            else config.default_pupil_plane_distance_mm
+        ),
+    )
+
+
 def _render_array_image(
     config: ArrayGhostSimulationConfig,
     row: dict[str, Any],
     psf_cache: PinholePsfCache,
     kernel_cache: SolarKernelCache,
     use_solar_disk: bool,
+    minimum_half_width_arcmin: float | None = None,
 ) -> tuple[Any, dict[str, Any], ArrayLayout, float]:
     """按一行扫描指标重建对应的阵列强度图。"""
     layout = _representative_layout(config, row)
@@ -5476,17 +5717,29 @@ def _render_array_image(
             config.sun_width_energy_fraction,
             config,
         )
+    weight_config = _weight_config_for_row(config, row)
     weights_np, _weight_model = compute_hole_weights(
         layout,
         _row_float(row, "pupil_diameter_mm"),
-        config,
+        weight_config,
     )
-    shifts_np = (
-        layout.centers_mm / config.focal_length_mm * ARCMINUTES_PER_RADIAN
+    active_mask = weights_np > config.floating_comparison_tolerance
+    if not bool(active_mask.any()):
+        raise ValueError("array render requires at least one transmitting hole")
+    weights_np = weights_np[active_mask]
+    shifts_np = defocus_hole_shifts_arcmin(
+        layout.centers_mm,
+        myopia_d,
     )
+    shifts_np = shifts_np[active_mask]
     shifts = cp.asarray(shifts_np, dtype=cp.float32)
     weights = cp.asarray(weights_np, dtype=config.accumulator_dtype)
-    field = plan_field_grid(shifts, image_width_arcmin, config)
+    field = plan_field_grid(
+        shifts,
+        image_width_arcmin,
+        config,
+        minimum_half_width_arcmin=minimum_half_width_arcmin,
+    )
     result = accumulate_shifted_kernels(
         kernel,
         kernel_pixel_arcmin,
@@ -5496,6 +5749,92 @@ def _render_array_image(
         config,
     )
     return result, field, layout, image_width_arcmin
+
+
+@dataclass(frozen=True)
+class RetinalOptotypeSamplingConfig:
+    """第二阶段 E 视标生成器在当前阵列视场上的采样适配。"""
+
+    target_angular_pixel_arcmin: float
+    optotype_anti_alias_fraction: float
+
+
+def build_retinal_optotype_scene(
+    field: dict[str, Any],
+    config: ArrayGhostSimulationConfig,
+) -> tuple[Any, dict[str, float]]:
+    """用第二阶段的 E 视标生成器建立视网膜输入场景。
+
+    这里不复用 RetinaSimulationConfig 的 16 px/arcmin 下限，因为阵列重影
+    需要覆盖正负上千角分的视场；但 E 的几何形状和抗锯齿规则直接来自
+    single_hole_retinal_image.build_e_optotype，不重新绘制另一套 E。
+    """
+    grid_size = int(field["grid_size"])
+    pixel_arcmin = float(field["pixel_arcmin"])
+    sampling = RetinalOptotypeSamplingConfig(
+        target_angular_pixel_arcmin=pixel_arcmin,
+        optotype_anti_alias_fraction=config.retinal_scene_antialias_fraction,
+    )
+    axis_arcmin = (
+        cp.arange(grid_size, dtype=cp.float32) - grid_size // 2
+    ) * pixel_arcmin
+    x_arcmin, y_arcmin = cp.meshgrid(
+        axis_arcmin,
+        axis_arcmin,
+        indexing="xy",
+    )
+    scene = build_e_optotype(
+        x_arcmin,
+        y_arcmin,
+        config.retinal_scene_stroke_arcmin,
+        sampling,
+    ).astype(config.real_dtype)
+    metadata = {
+        "peak": float(scene.max()),
+        "total_energy": float(scene.sum(dtype=config.accumulator_dtype)),
+        "pixel_arcmin": pixel_arcmin,
+        "stroke_arcmin": config.retinal_scene_stroke_arcmin,
+        "grid_size": float(grid_size),
+    }
+    return scene, metadata
+
+
+def convolve_retinal_scene_with_array_psf(
+    scene: Any,
+    array_psf: Any,
+    config: ArrayGhostSimulationConfig,
+) -> tuple[Any, dict[str, float]]:
+    """计算 I_retina = I_scene * PSF_array。
+
+    沿用第二阶段的中心约定：不预先 ifftshift，完成 full 卷积后从
+    PSF 数组中心开始裁切。主像和重影按孔心位移 M r 复制整个 E 视标。
+    """
+    if scene.shape != array_psf.shape:
+        raise ValueError("scene and array PSF must have identical shapes")
+    scene_energy = float(scene.sum(dtype=config.accumulator_dtype))
+    array_psf_energy = float(
+        array_psf.sum(dtype=config.accumulator_dtype)
+    )
+    convolved = fftconvolve(
+        scene,
+        array_psf,
+        mode=config.convolution_mode,
+    )
+    start_y = array_psf.shape[0] // 2
+    start_x = array_psf.shape[1] // 2
+    cropped = convolved[
+        start_y : start_y + scene.shape[0],
+        start_x : start_x + scene.shape[1],
+    ]
+    total_energy = float(cropped.sum(dtype=config.accumulator_dtype))
+    metadata = {
+        "scene_total_energy": scene_energy,
+        "array_psf_total_energy": array_psf_energy,
+        "retinal_total_energy": total_energy,
+        "expected_total_energy": scene_energy * array_psf_energy,
+        "peak": float(cropped.max()),
+    }
+    return cropped.astype(config.real_dtype), metadata
 
 
 def _display_image_panel(
@@ -5513,7 +5852,9 @@ def _display_image_panel(
     )
     half_width_arcmin = float(field["half_width_arcmin"])
     axis.imshow(
-        host_image,
+        # 仅显示层把零强度抬到对数下限；否则 LogNorm 会把零值显示成
+        # 白色坏点，稀疏 PSF 支撑区会被误读成黑白掩膜方块。
+        np.maximum(host_image, floor),
         origin="lower",
         extent=(
             -half_width_arcmin,
@@ -5538,34 +5879,99 @@ def _display_image_panel(
     axis.set_aspect("equal")
 
 
-def _add_ghost_order_circles(
+def _display_retinal_scene_panel(
     axis: plt.Axes,
-    pitch_mm: float,
+    retinal_image: Any,
+    field: dict[str, Any],
     config: ArrayGhostSimulationConfig,
-) -> None:
-    first_order_angle_arcmin = (
-        pitch_mm / config.focal_length_mm * ARCMINUTES_PER_RADIAN
+    title: str,
+    display_peak: float,
+    annotation: str | None = None,
+) -> Any:
+    """显示共享亮度标尺下的 E 视标主像与重影。"""
+    host_image = cp.asnumpy(retinal_image)
+    half_width_arcmin = float(field["half_width_arcmin"])
+    image_artist = axis.imshow(
+        host_image,
+        origin="lower",
+        extent=(
+            -half_width_arcmin,
+            half_width_arcmin,
+            -half_width_arcmin,
+            half_width_arcmin,
+        ),
+        cmap=config.retinal_scene_colormap_name,
+        vmin=0.0,
+        vmax=max(display_peak, np.finfo(np.float64).tiny),
+        interpolation="nearest",
     )
-    for order, line_style, label in (
-        (1, "--", "一阶 / first order p/f"),
-        (2, ":", "二阶 / second order 2p/f"),
-    ):
-        axis.add_patch(
-            plt.Circle(
-                (0.0, 0.0),
-                order * first_order_angle_arcmin,
-                fill=False,
-                edgecolor="white",
-                linestyle=line_style,
-                linewidth=1.2,
-                alpha=0.85,
-                label=label,
-            )
+    axis.set_title(title, fontsize=config.panel_title_font_size)
+    axis.set_xlabel(
+        "视网膜角坐标 / Retinal angle (arcmin)",
+        fontsize=config.axis_label_font_size,
+    )
+    axis.set_ylabel(
+        "视网膜角坐标 / Retinal angle (arcmin)",
+        fontsize=config.axis_label_font_size,
+    )
+    axis.tick_params(labelsize=config.tick_font_size)
+    axis.set_aspect("equal")
+    if annotation:
+        axis.text(
+            0.02,
+            0.98,
+            annotation,
+            transform=axis.transAxes,
+            ha="left",
+            va="top",
+            fontsize=config.conclusion_font_size,
+            color="white",
+            bbox={
+                "facecolor": "black",
+                "alpha": 0.58,
+                "edgecolor": "none",
+                "pad": 2.0,
+            },
         )
-    axis.legend(
-        loc="upper right",
-        fontsize=config.legend_font_size,
-        framealpha=0.78,
+    return image_artist
+
+
+def _point_source_profiles(
+    result: dict[str, Any],
+    field: dict[str, Any],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """返回归一化水平截面和径向最大值包络。"""
+    host_image = cp.asnumpy(result["image"]).astype(np.float64)
+    pixel_arcmin = float(field["pixel_arcmin"])
+    grid_size = int(host_image.shape[0])
+    centre = grid_size // 2
+    peak = max(float(host_image.max()), np.finfo(np.float64).tiny)
+
+    signed_angle_arcmin = (
+        np.arange(grid_size, dtype=np.float64) - centre
+    ) * pixel_arcmin
+    horizontal_profile = host_image[centre, :] / peak
+
+    grid_y, grid_x = np.indices(host_image.shape, dtype=np.float64)
+    radius_arcmin = (
+        np.hypot(grid_x - centre, grid_y - centre) * pixel_arcmin
+    )
+    radius_bin = np.floor(radius_arcmin / pixel_arcmin).astype(np.int64)
+    radial_maximum = np.zeros(int(radius_bin.max()) + 1, dtype=np.float64)
+    np.maximum.at(
+        radial_maximum,
+        radius_bin.ravel(),
+        host_image.ravel(),
+    )
+    radial_angle_arcmin = (
+        np.arange(radial_maximum.size, dtype=np.float64) + 0.5
+    ) * pixel_arcmin
+    radial_maximum /= peak
+    return (
+        signed_angle_arcmin,
+        horizontal_profile,
+        radial_angle_arcmin,
+        radial_maximum,
     )
 
 
@@ -5764,11 +6170,18 @@ def save_point_source_array_psf_figure(
     psf_cache: PinholePsfCache,
     directory: Path,
 ) -> None:
-    """点源阵列 PSF：突出平移复制与一阶、二阶重影。"""
+    """点源阵列角截面：展示峰位、峰间距和重叠，不绘制二维点阵。"""
     rows = _rows_at_smallest_pitch(
         _rows_for_group(metric_rows, "fixed_hole_count_layout"),
         ARRAY_PATTERN_KINDS,
     )
+    rows = [
+        _row_with_pupil_vignetting(
+            row,
+            config.retinal_scene_pattern_pupil_mm,
+        )
+        for row in rows
+    ]
     row_count, column_count = _figure_grid_shape(len(rows))
     figure, axes = plt.subplots(
         row_count,
@@ -5788,21 +6201,82 @@ def save_point_source_array_psf_figure(
             kernel_cache,
             use_solar_disk=False,
         )
-        _display_image_panel(
-            axis,
-            result,
-            field,
-            config,
+        stats = _retinal_scene_ghost_stats(config, row, layout)
+        (
+            signed_angle_arcmin,
+            horizontal_profile,
+            radial_angle_arcmin,
+            radial_maximum,
+        ) = _point_source_profiles(result, field)
+        first_order_arcmin = defocus_first_order_angle_arcmin(
+            layout.pitch_nominal_mm,
+            _row_float(row, "myopia_d"),
+        )
+        profile_limit_arcmin = max(
+            2.25 * first_order_arcmin,
+            float(field["pixel_arcmin"]),
+        )
+        axis.plot(
+            signed_angle_arcmin,
+            horizontal_profile,
+            color="#1565c0",
+            linewidth=1.4,
+            label="水平角截面 / horizontal",
+        )
+        axis.plot(
+            radial_angle_arcmin,
+            radial_maximum,
+            color="#d84315",
+            linewidth=1.2,
+            linestyle="--",
+            label="径向最大值 / radial max",
+        )
+        axis.plot(
+            -radial_angle_arcmin,
+            radial_maximum,
+            color="#d84315",
+            linewidth=1.2,
+            linestyle="--",
+        )
+        for order, line_style in ((1, "--"), (2, ":")):
+            for sign in (-1.0, 1.0):
+                axis.axvline(
+                    sign * order * first_order_arcmin,
+                    color="0.35",
+                    linestyle=line_style,
+                    linewidth=0.9,
+                    alpha=0.75,
+                )
+        axis.set_xlim(-profile_limit_arcmin, profile_limit_arcmin)
+        axis.set_ylim(0.0, 1.05)
+        axis.grid(alpha=0.22, linewidth=0.7)
+        axis.set_title(
             f"{array_pattern_display_name(layout.pattern_kind)}\n"
             f"p={layout.pitch_nominal_mm:g} mm, d={layout.diameter_mm:g} mm, "
-            f"N={layout.hole_count}",
+            f"D={_row_float(row, 'pupil_diameter_mm'):g} mm, "
+            f"N_eff={int(stats['active_hole_count'])}/{layout.hole_count}",
+            fontsize=config.panel_title_font_size,
         )
-        _add_ghost_order_circles(axis, layout.pitch_nominal_mm, config)
+        axis.set_xlabel(
+            "相对视网膜角 / Retinal angle (arcmin)",
+            fontsize=config.axis_label_font_size,
+        )
+        axis.set_ylabel(
+            "归一化强度 / Normalized intensity",
+            fontsize=config.axis_label_font_size,
+        )
+        axis.tick_params(labelsize=config.tick_font_size)
+        axis.legend(
+            loc="upper right",
+            fontsize=config.legend_font_size,
+            framealpha=0.82,
+        )
     _save_figure(
         figure,
         directory / config.point_source_figure_filename,
         config,
-        "点源阵列 PSF 与重影阶次 / Point-source array PSF and ghost orders",
+        "点源角截面：虚线标出一阶 M p 与二阶 2 M p / "
+        "Point-source angular profiles",
     )
 
 
@@ -5868,6 +6342,304 @@ def save_solar_ghost_comparison_figure(
         directory / config.solar_comparison_figure_filename,
         config,
         "太阳扩展源下的阵列重影对比 / Solar-source array ghost comparison",
+    )
+
+
+def _row_with_pupil_vignetting(
+    row: dict[str, Any],
+    pupil_diameter_mm: float,
+) -> dict[str, Any]:
+    """复制扫描行，并显式使用给定瞳孔直径的孔间权重。"""
+    adjusted = dict(row)
+    adjusted["pupil_diameter_mm"] = pupil_diameter_mm
+    adjusted["weight_model"] = "quasi_static_pupil"
+    return adjusted
+
+
+def _retinal_scene_ghost_stats(
+    config: ArrayGhostSimulationConfig,
+    row: dict[str, Any],
+    layout: ArrayLayout,
+) -> dict[str, float]:
+    """给出 E 视标图中有效孔、位移、重叠和单孔模糊的归一化指标。"""
+    weight_config = _weight_config_for_row(config, row)
+    weights, _weight_model = compute_hole_weights(
+        layout,
+        _row_float(row, "pupil_diameter_mm"),
+        weight_config,
+    )
+    active = weights > config.floating_comparison_tolerance
+    active_weights = weights[active]
+    active_centers = layout.centers_mm[active]
+    if active_weights.size == 0:
+        return {
+            "active_hole_count": 0.0,
+            "relative_throughput": 0.0,
+            "ghost_peak_ratio": 0.0,
+            "ghost_energy_fraction": 0.0,
+            "ghost_angle_arcmin": 0.0,
+            "image_overlap_ratio": 0.0,
+            "pitch_to_pupil_ratio": 0.0,
+            "single_hole_blur_arcmin": 0.0,
+            "ghost_shift_fraction": 0.0,
+            "ghost_overlap_fraction": 0.0,
+            "single_hole_blur_fraction": 0.0,
+        }
+    reference_index = int(
+        np.argmin((active_centers**2).sum(axis=1))
+    )
+    reference_weight = float(active_weights[reference_index])
+    ghost_weights = np.delete(active_weights, reference_index)
+    ghost_peak_ratio = (
+        float(ghost_weights.max()) / reference_weight
+        if ghost_weights.size > 0 and reference_weight > 0.0
+        else 0.0
+    )
+    total_weight = float(active_weights.sum())
+    ghost_angle_arcmin = (
+        defocus_first_order_angle_arcmin(
+            layout.pitch_nominal_mm,
+            _row_float(row, "myopia_d"),
+        )
+    )
+    single_hole_blur_arcmin = defocus_geometric_blur_arcmin(
+        layout.diameter_mm,
+        _row_float(row, "myopia_d"),
+    )
+    ghost_energy_fraction = (
+        1.0 - reference_weight / total_weight
+        if total_weight > 0.0 and ghost_angle_arcmin > 0.0
+        else 0.0
+    )
+    optotype_width_arcmin = config.retinal_scene_optotype_width_factor * (
+        config.retinal_scene_stroke_arcmin
+    )
+    has_secondary_hole = ghost_weights.size > 0
+    ghost_shift_fraction = (
+        ghost_angle_arcmin / optotype_width_arcmin
+        if has_secondary_hole and optotype_width_arcmin > 0.0
+        else 0.0
+    )
+    single_hole_blur_fraction = (
+        single_hole_blur_arcmin / optotype_width_arcmin
+        if has_secondary_hole and optotype_width_arcmin > 0.0
+        else 0.0
+    )
+    return {
+        "active_hole_count": float(active_weights.size),
+        "relative_throughput": total_weight,
+        "ghost_peak_ratio": ghost_peak_ratio,
+        "ghost_energy_fraction": ghost_energy_fraction,
+        "ghost_angle_arcmin": ghost_angle_arcmin,
+        "pitch_to_pupil_ratio": (
+            layout.pitch_nominal_mm
+            / _row_float(row, "pupil_diameter_mm")
+        ),
+        "single_hole_blur_arcmin": single_hole_blur_arcmin,
+        "ghost_shift_fraction": ghost_shift_fraction,
+        "ghost_overlap_fraction": (
+            max(0.0, 1.0 - ghost_shift_fraction)
+            if has_secondary_hole
+            else 0.0
+        ),
+        "single_hole_blur_fraction": single_hole_blur_fraction,
+        # 兼容旧的绘图调用；它表示孔间位移相对 E 视标宽度，不是面积重叠率。
+        "image_overlap_ratio": ghost_shift_fraction,
+    }
+
+
+def _save_retinal_scene_figure(
+    config: ArrayGhostSimulationConfig,
+    rows: Sequence[dict[str, Any]],
+    psf_cache: PinholePsfCache,
+    kernel_cache: SolarKernelCache,
+    directory: Path,
+    filename: str,
+    suptitle: str,
+    figure_size_inches: tuple[float, float],
+) -> None:
+    """显示 E 视标经过阵列后的主像与重影。"""
+    rendered = []
+    minimum_half_width_arcmin = (
+        config.retinal_scene_min_half_width_factor
+        * config.retinal_scene_stroke_arcmin
+    )
+    for row in rows:
+        result, field, layout, _image_width = _render_array_image(
+            config,
+            row,
+            psf_cache,
+            kernel_cache,
+            use_solar_disk=False,
+            minimum_half_width_arcmin=minimum_half_width_arcmin,
+        )
+        scene, scene_metadata = build_retinal_optotype_scene(field, config)
+        retinal_image, convolution_metadata = (
+            convolve_retinal_scene_with_array_psf(
+                scene,
+                result["image"],
+                config,
+            )
+        )
+        rendered.append(
+            {
+                "row": row,
+                "layout": layout,
+                "field": field,
+                "scene": scene,
+                "scene_metadata": scene_metadata,
+                "retinal_image": retinal_image,
+                "convolution_metadata": convolution_metadata,
+                "ghost_stats": _retinal_scene_ghost_stats(
+                    config,
+                    row,
+                    layout,
+                ),
+            }
+        )
+
+    if not rendered:
+        raise ValueError("retinal scene figure requires at least one row")
+
+    reference_field = rendered[0]["field"]
+    reference_scene = rendered[0]["scene"]
+    reference_scene_metadata = rendered[0]["scene_metadata"]
+    panel_count = len(rendered) + 1
+    row_count, column_count = _figure_grid_shape(panel_count)
+    figure, axes = plt.subplots(
+        row_count,
+        column_count,
+        figsize=figure_size_inches,
+        dpi=config.figure_dpi,
+        squeeze=False,
+    )
+    for axis in axes.ravel()[panel_count:]:
+        axis.axis("off")
+
+    display_peak = max(
+        float(item["retinal_image"].max()) for item in rendered
+    ) * config.retinal_scene_display_scale_fraction
+    _display_retinal_scene_panel(
+        axes.ravel()[0],
+        reference_scene,
+        reference_field,
+        config,
+        "输入 E 视标 / Input E optotype\n"
+        f"stroke={reference_scene_metadata['stroke_arcmin']:g} arcmin",
+        float(reference_scene_metadata["peak"]),
+    )
+    for axis, item in zip(axes.ravel()[1:], rendered):
+        row = item["row"]
+        layout = item["layout"]
+        stats = item["ghost_stats"]
+        title = (
+            f"{array_pattern_display_name(layout.pattern_kind)}\n"
+            f"p={layout.pitch_nominal_mm:g} mm, "
+            f"d={layout.diameter_mm:g} mm, "
+            f"D={_row_float(row, 'pupil_diameter_mm'):g} mm"
+        )
+        annotation = (
+            f"theta1={stats['ghost_angle_arcmin']:.1f} arcmin\n"
+            f"N_eff={int(stats['active_hole_count'])} / {layout.hole_count}, "
+            f"p/D={stats['pitch_to_pupil_ratio']:.2f}\n"
+            f"shift/W={stats['ghost_shift_fraction']:.2f}, "
+            f"overlap={stats['ghost_overlap_fraction']:.2f}\n"
+            f"Md/W={stats['single_hole_blur_fraction']:.2f}, "
+            f"peak={stats['ghost_peak_ratio']:.2f}, "
+            f"E_g={stats['ghost_energy_fraction']:.2f}"
+        )
+        _display_retinal_scene_panel(
+            axis,
+            item["retinal_image"],
+            item["field"],
+            config,
+            title,
+            display_peak,
+            annotation,
+        )
+    _save_figure(
+        figure,
+        directory / filename,
+        config,
+        suptitle,
+    )
+
+
+def save_retinal_scene_figure(
+    config: ArrayGhostSimulationConfig,
+    metric_rows: Sequence[dict[str, Any]],
+    psf_cache: PinholePsfCache,
+    kernel_cache: SolarKernelCache,
+    directory: Path,
+) -> None:
+    """有限瞳孔下比较五种排布对点源 PSF 与 E 视标重影的影响。"""
+    rows = _rows_at_smallest_pitch(
+        _rows_for_group(metric_rows, "fixed_hole_count_layout"),
+        ARRAY_PATTERN_KINDS,
+    )
+    rows = [
+        _row_with_pupil_vignetting(
+            row,
+            config.retinal_scene_pattern_pupil_mm,
+        )
+        for row in rows
+    ]
+    _save_retinal_scene_figure(
+        config,
+        rows,
+        psf_cache,
+        kernel_cache,
+        directory,
+        config.retinal_scene_figure_filename,
+        "点源 PSF 下有限瞳孔对 E 视标重影方向的影响 / "
+        "E-optotype ghost directions under a finite pupil",
+        config.retinal_scene_figure_size_inches,
+    )
+
+
+def save_retinal_pitch_scene_figure(
+    config: ArrayGhostSimulationConfig,
+    metric_rows: Sequence[dict[str, Any]],
+    psf_cache: PinholePsfCache,
+    kernel_cache: SolarKernelCache,
+    directory: Path,
+) -> None:
+    """固定排布与孔径时，孔距对重影分离和可见强度的影响。"""
+    rows = sorted(
+        (
+            row
+            for row in _rows_for_group(
+                metric_rows,
+                "fixed_hole_count_layout",
+            )
+            if str(row["pattern_kind"]) == ARRAY_PATTERN_SQUARE_PACKING
+        ),
+        key=lambda row: _row_float(row, "pitch_mm"),
+    )
+    rows = [
+        _row_with_pupil_vignetting(
+            {
+                **row,
+                "diameter_mm": config.retinal_scene_pitch_diameter_mm,
+                "pitch_to_diameter_ratio": (
+                    _row_float(row, "pitch_mm")
+                    / config.retinal_scene_pitch_diameter_mm
+                ),
+            },
+            config.retinal_scene_pitch_pupil_mm,
+        )
+        for row in rows
+    ]
+    _save_retinal_scene_figure(
+        config,
+        rows,
+        psf_cache,
+        kernel_cache,
+        directory,
+        config.retinal_pitch_scene_figure_filename,
+        "孔距、有限瞳孔与重影分离 / "
+        "Hole pitch, finite pupil and retinal ghost separation",
+        config.retinal_pitch_scene_figure_size_inches,
     )
 
 
@@ -6380,7 +7152,10 @@ def save_design_comparison_figure(
     metric_specs = (
         ("separation_to_width_ratio", "分离宽度比 / Separation-to-width"),
         ("max_ghost_peak_ratio", "最大重影峰比 / Max ghost peak ratio"),
-        ("ghost_integrated_fraction", "主窗外能量 / Ghost energy fraction"),
+        (
+            "ghost_integrated_fraction",
+            "非参考孔通光占比 / Non-reference throughput",
+        ),
         ("ghost_count", "可见重影数 / Visible ghost count"),
     )
     figure, axes = plt.subplots(
@@ -6542,6 +7317,20 @@ def save_all_figures(
     save_mask_figure(config, directory)
     save_point_source_array_psf_figure(
         config, metric_rows, psf_cache, directory
+    )
+    save_retinal_scene_figure(
+        config,
+        metric_rows,
+        psf_cache,
+        kernel_cache,
+        directory,
+    )
+    save_retinal_pitch_scene_figure(
+        config,
+        metric_rows,
+        psf_cache,
+        kernel_cache,
+        directory,
     )
     save_solar_ghost_comparison_figure(
         config,

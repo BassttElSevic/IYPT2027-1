@@ -2,12 +2,12 @@ anchor_id,description,measured,expected,relative_error_percent,tolerance_percent
 V-A-square_packing,mask numeric area vs analytic circle area,0.0006471873905305149,0.0,nan,1.0,1.0,True,"components=81/81, min_circularity=0.9469"
 V-A-triangular_packing,mask numeric area vs analytic circle area,0.019654918362246955,0.0,nan,1.0,1.0,True,"components=81/81, min_circularity=0.9159"
 V-A-hexagonal_packing,mask numeric area vs analytic circle area,0.007149250137302502,0.0,nan,1.0,1.0,True,"components=76/76, min_circularity=0.9397"
-V-B-first-order-angle,first-order ghost angle vs p / f,275.0197416627952,275.0197416627952,0.0,5.0,nan,True,pattern=square_packing
-V-F-energy,image total energy vs sum of hole weights,80.999999956414,81.0,5.380987507426956e-08,0.1,nan,True,holes=81
+V-B-first-order-angle,first-order ghost angle vs M p,20.626480624709636,20.62648062470964,1.7224041965474722e-14,5.0,nan,True,pattern=square_packing
+V-F-energy,image total energy vs sum of hole weights,80.99999994081344,81.0,7.306982892551775e-08,0.1,nan,True,holes=81
 V-D-single-hole-degeneration,single central hole returns unit energy at field centre,1.0000000000000002,1.0,2.220446049250313e-14,0.1,nan,True,one-hole layout must equal the single-hole kernel
-V-E-two-hole-separation,symmetric two-hole pair separation vs p / f,275.0197416627952,275.0197416627952,0.0,5.0,nan,True,pair is placed symmetrically about the reference centre
-V-E-two-hole-centre-null,image at the midpoint of a symmetric pair,0.0,0.0,nan,0.0,0.001,True,midpoint value must be far below the two ghost peaks; peak=7.59438e-05
-V-C-incoherent-sum,two identical holes show no periodic interference modulation,2.058279034541916e-05,0.0,nan,0.0,0.001,True,mirror symmetry holds for intensity summation only
+V-E-two-hole-separation,symmetric two-hole pair separation vs M p,20.62648062470964,20.62648062470964,0.0,5.0,nan,True,pair is placed symmetrically about the reference centre
+V-E-two-hole-centre-null,image at the midpoint of a symmetric pair,0.0031252731298026045,0.0,nan,0.0,0.01,True,midpoint value must be far below the two ghost peaks; peak=0.00428758
+V-C-incoherent-sum,two identical holes show no periodic interference modulation,9.448814792803782e-06,0.0,nan,0.0,0.001,True,mirror symmetry holds for intensity summation only
 V-G-solar-width,dense direction sum vs disk convolution image width,22.45499156826594,22.454202554544267,0.0035138799507812824,2.0,nan,True,"samples=18432, disk_weight_sum=1.000000011"
 V-G-solar-peak,dense direction sum vs disk convolution peak,7.732762605883181e-05,7.712522346992046e-05,0.26243371468517485,2.0,nan,True,peak converges slowly with direction count; see plan section 6.3
 V-G-solar-weight-sum,solar disk kernel weight sum,1.0000000113977876,1.0,1.1397787602618337e-06,9.999999999999999e-05,nan,True,area weights must normalise to one
@@ -22,6 +22,6 @@ V-J-fixed-area-fraction,scaling diameter and pitch together keeps analytic area 
 V-K-anchor-M1,primary diameter anchor comes from the second stage,1.1005248747756682,1.1005248747756682,0.0,1e-06,nan,True,source=retinal_optotype_primary
 V-K-anchor-M2,primary diameter anchor comes from the second stage,0.7781886018183509,0.7781886018183509,0.0,1e-06,nan,True,source=retinal_optotype_primary
 V-K-anchor-M3,primary diameter anchor comes from the second stage,0.6353883327016112,0.6353883327016112,0.0,1e-06,nan,True,source=retinal_optotype_primary
-V-K-cache-recompute-M1,cached single-hole PSF equals a fresh FFT computation,0.0,0.0,nan,0.0,1e-06,True,"psf_cache computes=50, hits=2"
-V-K-cache-recompute-M2,cached single-hole PSF equals a fresh FFT computation,0.0,0.0,nan,0.0,1e-06,True,"psf_cache computes=50, hits=3"
+V-K-cache-recompute-M1,cached single-hole PSF equals a fresh FFT computation,0.0,0.0,nan,0.0,1e-06,True,"psf_cache computes=53, hits=3"
+V-K-cache-recompute-M2,cached single-hole PSF equals a fresh FFT computation,0.0,0.0,nan,0.0,1e-06,True,"psf_cache computes=53, hits=4"
 V-K-coarse-check-recorded,coarse diameter-pitch check rows are retained,135.0,135.0,0.0,1e-06,nan,True,coarse grid is reported separately from the refined grid
