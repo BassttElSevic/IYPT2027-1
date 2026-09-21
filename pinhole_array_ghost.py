@@ -916,10 +916,12 @@ from typing import Any, Iterable, Sequence
 
 import cupy as cp
 import matplotlib
+import numpy as np
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+from scipy.spatial import cKDTree
 from cupyx.scipy.ndimage import map_coordinates
 from cupyx.scipy.signal import fftconvolve
 
@@ -1524,6 +1526,483 @@ def print_progress(
         f"elapsed {elapsed:7.1f}s",
         flush=True,
     )
+
+
+# ============================================================================
+# 实现部分 2/5：五种孔心排布与排布质检
+# ============================================================================
+#
+# 排布函数只负责生成孔心坐标和几何元数据，不画图、不写文件、不做光学计算。
+# 孔心在 CPU 上用 NumPy 生成（方案第 12 节：掩膜与几何在 CPU，光学在 GPU），
+# 进入光学计算前再显式上传。
+
+
+@dataclass(frozen=True)
+class ArrayLayout:
+    """一次排布生成的全部几何结果。"""
+
+    pattern_kind: str
+    centers_mm: Any
+    pitch_nominal_mm: float
+    diameter_mm: float
+    row_count: int
+    column_count: int
+    ring_count: int
+    holes_per_ring: tuple[int, ...]
+    ring_radii_mm: tuple[float, ...]
+    ring_radial_pitch_mm: float
+    analytic_area_fraction: float
+    notes: str
+
+    @property
+    def hole_count(self) -> int:
+        return int(self.centers_mm.shape[0])
+
+
+def analytic_area_fraction(
+    pattern_kind: str,
+    diameter_mm: float,
+    pitch_mm: float,
+) -> float:
+    """方案 2.2 到 2.6 节给出的解析面积分数。
+
+    蜂窝与环阵列没有单一解析式，返回 NaN，由掩膜数值统计给出面积分数。
+    """
+    if pitch_mm <= 0.0:
+        raise ValueError("pitch_mm must be positive")
+    unit_cell_factor = {
+        ARRAY_PATTERN_SQUARE_PACKING: math.pi / 4.0,
+        ARRAY_PATTERN_TRIANGULAR_PACKING: math.pi / (2.0 * math.sqrt(3.0)),
+    }
+    factor = unit_cell_factor.get(pattern_kind)
+    if factor is None:
+        return math.nan
+    return factor * (diameter_mm / pitch_mm) ** 2
+
+
+def build_pitch_grid(
+    config: ArrayGhostSimulationConfig,
+    diameter_mm: float,
+) -> tuple[float, ...]:
+    """对数采样孔距，并保证下界同时满足瞳孔和加工约束。"""
+    lower_bound = max(
+        config.minimum_pitch_mm,
+        diameter_mm + config.minimum_edge_clearance_mm,
+    )
+    upper_bound = max(config.maximum_pitch_mm, lower_bound)
+    if config.pitch_log_count == 1:
+        values = [lower_bound]
+    else:
+        log_min = math.log(lower_bound)
+        log_max = math.log(upper_bound)
+        step = (log_max - log_min) / (config.pitch_log_count - 1)
+        values = [math.exp(log_min + index * step) for index in range(config.pitch_log_count)]
+    return tuple(values)
+
+
+def _centered_index_range(count: int) -> np.ndarray:
+    """对称整数索引，且保证 0 在范围内，使参考主孔落在原点。"""
+    return np.arange(count) - count // 2
+
+
+def generate_square_packing(
+    config: ArrayGhostSimulationConfig,
+    pitch_mm: float,
+    diameter_mm: float,
+) -> ArrayLayout:
+    """方案 2.2 节：正方形密铺，孔心位于正方形单元中心。"""
+
+    row_count = config.effective_row_count()
+    column_count = config.effective_column_count()
+    x_offsets = _centered_index_range(column_count) * pitch_mm
+    y_offsets = _centered_index_range(row_count) * pitch_mm
+    grid_x, grid_y = np.meshgrid(x_offsets, y_offsets, indexing="xy")
+    centers = np.stack((grid_x.ravel(), grid_y.ravel()), axis=1)
+    centers = _truncate_to_extent(centers, config.array_extent_radius_mm)
+
+    return ArrayLayout(
+        pattern_kind=ARRAY_PATTERN_SQUARE_PACKING,
+        centers_mm=centers,
+        pitch_nominal_mm=pitch_mm,
+        diameter_mm=diameter_mm,
+        row_count=row_count,
+        column_count=column_count,
+        ring_count=0,
+        holes_per_ring=(),
+        ring_radii_mm=(),
+        ring_radial_pitch_mm=pitch_mm,
+        analytic_area_fraction=analytic_area_fraction(
+            ARRAY_PATTERN_SQUARE_PACKING, diameter_mm, pitch_mm
+        ),
+        notes="square unit cell, four nearest neighbours along x and y",
+    )
+
+
+def generate_triangular_packing(
+    config: ArrayGhostSimulationConfig,
+    pitch_mm: float,
+    diameter_mm: float,
+) -> ArrayLayout:
+    """方案 2.3 节：三角形密铺，同时也是 PDF 的'六边形密排'。"""
+
+    row_count = (
+        config.quick_row_count if config.quick_mode else config.triangular_row_count
+    )
+    column_count = (
+        config.quick_column_count
+        if config.quick_mode
+        else config.triangular_column_count
+    )
+    row_spacing_mm = pitch_mm * math.sqrt(3.0) / 2.0
+    centers: list[tuple[float, float]] = []
+    for row_index in range(row_count):
+        row_offset = 0.5 * pitch_mm if row_index % 2 else 0.0
+        y_mm = (row_index - (row_count - 1) / 2.0) * row_spacing_mm
+        for column_index in range(column_count):
+            x_mm = (
+                column_index - (column_count - 1) / 2.0
+            ) * pitch_mm + row_offset
+            centers.append((x_mm, y_mm))
+    centers_array = np.asarray(centers, dtype=np.float64)
+    centers_array = _truncate_to_extent(
+        centers_array, config.array_extent_radius_mm
+    )
+
+    return ArrayLayout(
+        pattern_kind=ARRAY_PATTERN_TRIANGULAR_PACKING,
+        centers_mm=centers_array,
+        pitch_nominal_mm=pitch_mm,
+        diameter_mm=diameter_mm,
+        row_count=row_count,
+        column_count=column_count,
+        ring_count=0,
+        holes_per_ring=(),
+        ring_radii_mm=(),
+        ring_radial_pitch_mm=row_spacing_mm,
+        analytic_area_fraction=analytic_area_fraction(
+            ARRAY_PATTERN_TRIANGULAR_PACKING, diameter_mm, pitch_mm
+        ),
+        notes=(
+            "triangular lattice, six nearest neighbours; this is the "
+            "PDF hexagonal close packing"
+        ),
+    )
+
+
+def generate_hexagonal_packing(
+    config: ArrayGhostSimulationConfig,
+    pitch_mm: float,
+    diameter_mm: float,
+) -> ArrayLayout:
+    """方案 2.4 节：蜂窝顶点型六边形密铺，三个最近邻。
+
+    蜂窝是带双原子基元的三角晶格：
+        基矢 a1 = (sqrt(3) p, 0)，a2 = (sqrt(3) p / 2, 3 p / 2)
+        基元 A = (0, 0)，B = (0, p)
+    这样同一子晶格内的最近邻距离为 p，每个内部孔恰好 3 个最近邻。
+    """
+
+    row_count = (
+        config.quick_row_count if config.quick_mode else config.honeycomb_row_count
+    )
+    column_count = (
+        config.quick_column_count
+        if config.quick_mode
+        else config.honeycomb_column_count
+    )
+    a1 = np.array([math.sqrt(3.0) * pitch_mm, 0.0])
+    a2 = np.array([0.5 * math.sqrt(3.0) * pitch_mm, 1.5 * pitch_mm])
+    basis = (np.array([0.0, 0.0]), np.array([0.0, pitch_mm]))
+
+    row_offsets = _centered_index_range(row_count)
+    column_offsets = _centered_index_range(column_count)
+    centers: list[tuple[float, float]] = []
+    for row_index in row_offsets:
+        for column_index in column_offsets:
+            origin = row_index * a2 + column_index * a1
+            for offset in basis:
+                point = origin + offset
+                centers.append((float(point[0]), float(point[1])))
+    centers_array = np.asarray(centers, dtype=np.float64)
+    centers_array = _truncate_to_extent(
+        centers_array, config.array_extent_radius_mm
+    )
+
+    return ArrayLayout(
+        pattern_kind=ARRAY_PATTERN_HEXAGONAL_PACKING,
+        centers_mm=centers_array,
+        pitch_nominal_mm=pitch_mm,
+        diameter_mm=diameter_mm,
+        row_count=row_count,
+        column_count=column_count,
+        ring_count=0,
+        holes_per_ring=(),
+        ring_radii_mm=(),
+        ring_radial_pitch_mm=math.sqrt(3.0) * pitch_mm,
+        analytic_area_fraction=math.nan,
+        notes=(
+            "honeycomb vertices, three nearest neighbours at 120 degrees; "
+            "area fraction must come from the rasterised mask"
+        ),
+    )
+
+
+def _truncate_to_extent(centers: Any, extent_radius_mm: float) -> Any:
+
+    radius = np.sqrt((centers**2).sum(axis=1))
+    return centers[radius <= extent_radius_mm]
+
+
+def minimum_ring_radius_mm(hole_count: int, pitch_mm: float) -> float:
+    """同一圈内相邻孔的**弦长**不小于孔距所需的最小半径。
+
+    踩坑提示：用弧长约束 2*pi*R/n >= p 是错的。孔心之间的真实距离是弦长
+    2*R*sin(pi/n)，它比弧长小；按弧长算出的半径会让 12 孔一圈的实际间距
+    只剩约 0.989 p，几何质检会判为孔太近。
+    """
+    if hole_count < 2:
+        raise ValueError("hole_count must be at least 2")
+    half_step_rad = math.pi / hole_count
+    return pitch_mm / (2.0 * math.sin(half_step_rad))
+
+
+def generate_hexagonal_rings(
+    config: ArrayGhostSimulationConfig,
+    pitch_mm: float,
+    diameter_mm: float,
+    ring_count: int,
+) -> ArrayLayout:
+    """方案 2.5 节：中心孔加同心六边形环，第 r 圈 6r 个孔。"""
+
+    if ring_count < 1:
+        raise ValueError("ring_count must be at least 1")
+    ring_radial_pitch_mm = max(config.hexagonal_ring_radial_pitch_mm, pitch_mm)
+    centers: list[tuple[float, float]] = [(0.0, 0.0)]
+    holes_per_ring: list[int] = []
+    ring_radii_mm: list[float] = []
+    for ring_index in range(1, ring_count + 1):
+        hole_count = 6 * ring_index
+        radius_mm = max(
+            ring_index * ring_radial_pitch_mm,
+            minimum_ring_radius_mm(hole_count, pitch_mm),
+        )
+        rotation_deg = (
+            config.hexagonal_ring_rotation_step_deg
+            * (ring_index - 1)
+            / ring_index
+        )
+        for hole_index in range(hole_count):
+            angle_deg = 360.0 * hole_index / hole_count + rotation_deg
+            angle_rad = math.radians(angle_deg)
+            centers.append(
+                (
+                    radius_mm * math.cos(angle_rad),
+                    radius_mm * math.sin(angle_rad),
+                )
+            )
+        holes_per_ring.append(hole_count)
+        ring_radii_mm.append(radius_mm)
+    centers_array = np.asarray(centers, dtype=np.float64)
+    centers_array = _truncate_to_extent(
+        centers_array, config.array_extent_radius_mm
+    )
+
+    return ArrayLayout(
+        pattern_kind=ARRAY_PATTERN_HEXAGONAL_RINGS,
+        centers_mm=centers_array,
+        pitch_nominal_mm=pitch_mm,
+        diameter_mm=diameter_mm,
+        row_count=0,
+        column_count=0,
+        ring_count=ring_count,
+        holes_per_ring=tuple(holes_per_ring),
+        ring_radii_mm=tuple(ring_radii_mm),
+        ring_radial_pitch_mm=ring_radial_pitch_mm,
+        analytic_area_fraction=math.nan,
+        notes=(
+            "central hole plus rings of 6r holes; ring radial pitch is "
+            "max(configured value, pitch)"
+        ),
+    )
+
+
+def generate_circular_rings(
+    config: ArrayGhostSimulationConfig,
+    pitch_mm: float,
+    diameter_mm: float,
+    holes_per_ring: Sequence[int] | None = None,
+) -> ArrayLayout:
+    """方案 2.6 节：中心孔加等孔数或逐圈递增的圆环。"""
+
+    counts = tuple(holes_per_ring or config.circular_ring_holes_per_ring)
+    if not counts:
+        raise ValueError("holes_per_ring must not be empty")
+    if any(count < 3 for count in counts):
+        raise ValueError("each ring needs at least 3 holes")
+    ring_radial_pitch_mm = max(config.circular_ring_radial_pitch_mm, pitch_mm)
+    radius_mm = ring_radial_pitch_mm
+    centers: list[tuple[float, float]] = [(0.0, 0.0)]
+    holes_per_ring_list: list[int] = []
+    ring_radii_mm: list[float] = []
+    for ring_index, hole_count in enumerate(counts, start=1):
+        # 同一圈内相邻孔的弦长必须不小于 p（见 minimum_ring_radius_mm）。
+        minimum_radius_mm = minimum_ring_radius_mm(hole_count, pitch_mm)
+        if ring_index == 1:
+            radius_mm = max(radius_mm, minimum_radius_mm)
+        else:
+            radius_mm = max(
+                radius_mm + ring_radial_pitch_mm,
+                minimum_radius_mm,
+            )
+        rotation_deg = (
+            config.circular_ring_rotation_step_deg * (ring_index - 1) / ring_index
+        )
+        for hole_index in range(hole_count):
+            angle_deg = 360.0 * hole_index / hole_count + rotation_deg
+            angle_rad = math.radians(angle_deg)
+            centers.append(
+                (
+                    radius_mm * math.cos(angle_rad),
+                    radius_mm * math.sin(angle_rad),
+                )
+            )
+        holes_per_ring_list.append(hole_count)
+        ring_radii_mm.append(radius_mm)
+    centers_array = np.asarray(centers, dtype=np.float64)
+    centers_array = _truncate_to_extent(
+        centers_array, config.array_extent_radius_mm
+    )
+
+    return ArrayLayout(
+        pattern_kind=ARRAY_PATTERN_CIRCULAR_RINGS,
+        centers_mm=centers_array,
+        pitch_nominal_mm=pitch_mm,
+        diameter_mm=diameter_mm,
+        row_count=0,
+        column_count=0,
+        ring_count=len(counts),
+        holes_per_ring=tuple(holes_per_ring_list),
+        ring_radii_mm=tuple(ring_radii_mm),
+        ring_radial_pitch_mm=ring_radial_pitch_mm,
+        analytic_area_fraction=math.nan,
+        notes=(
+            "central hole plus circular rings with configured hole counts; "
+            "arc spacing is reported separately"
+        ),
+    )
+
+
+def generate_jittered_square(
+    config: ArrayGhostSimulationConfig,
+    pitch_mm: float,
+    diameter_mm: float,
+    seed: int,
+) -> ArrayLayout:
+    """方案 2.7 节：可选随机对照，抖动不得破坏最小孔距。"""
+
+    base = generate_square_packing(config, pitch_mm, diameter_mm)
+    rng = np.random.default_rng(seed)
+    max_offset_mm = config.jitter_fraction * pitch_mm
+    offsets = rng.uniform(
+        -max_offset_mm,
+        max_offset_mm,
+        size=base.centers_mm.shape,
+    )
+    centers = base.centers_mm + offsets
+    return replace(
+        base,
+        centers_mm=centers,
+        notes=f"optional jittered square control, seed={seed}",
+    )
+
+
+def nearest_neighbor_statistics(
+    centers_mm: Any,
+    core_radius_mm: float,
+) -> dict[str, Any]:
+    """用 CPU 上的 cKDTree 统计最近邻距离与近邻数。"""
+
+    centers = np.asarray(centers_mm, dtype=np.float64)
+    if centers.shape[0] < 2:
+        return {
+            "nearest_neighbor_min_mm": math.nan,
+            "nearest_neighbor_mean_mm": math.nan,
+            "core_neighbor_count_mean": 0.0,
+            "core_neighbor_count_min": 0,
+            "core_neighbor_count_max": 0,
+        }
+    tree = cKDTree(centers)
+    distances, _ = tree.query(centers, k=2)
+    nearest = distances[:, 1]
+    neighbor_lists = tree.query_ball_point(centers, core_radius_mm)
+    # 去掉自身，只统计核心半径内的真实近邻数。
+    core_counts = np.array([len(entries) - 1 for entries in neighbor_lists])
+    return {
+        "nearest_neighbor_min_mm": float(nearest.min()),
+        "nearest_neighbor_mean_mm": float(nearest.mean()),
+        "core_neighbor_count_mean": float(core_counts.mean()),
+        "core_neighbor_count_min": int(core_counts.min()),
+        "core_neighbor_count_max": int(core_counts.max()),
+    }
+
+
+def validate_layout(
+    layout: ArrayLayout,
+    config: ArrayGhostSimulationConfig,
+) -> dict[str, Any]:
+    """方案 3.2 与 V-I：孔数、最小间距、边缘余量与近邻拓扑。"""
+
+    centers = np.asarray(layout.centers_mm, dtype=np.float64)
+    if centers.shape[0] == 0:
+        raise ValueError("layout contains no holes")
+    core_radius_mm = config.core_neighbor_radius_factor * layout.pitch_nominal_mm
+    statistics = nearest_neighbor_statistics(centers, core_radius_mm)
+    edge_clearance_mm = (
+        statistics["nearest_neighbor_min_mm"] - layout.diameter_mm
+        if math.isfinite(statistics["nearest_neighbor_min_mm"])
+        else math.nan
+    )
+
+    geometry_ok = True
+    if math.isfinite(edge_clearance_mm):
+        if edge_clearance_mm < config.minimum_edge_clearance_mm - config.floating_comparison_tolerance:
+            geometry_ok = False
+    else:
+        geometry_ok = False
+
+    expected_neighbors = {
+        ARRAY_PATTERN_SQUARE_PACKING: 4,
+        ARRAY_PATTERN_TRIANGULAR_PACKING: 6,
+        ARRAY_PATTERN_HEXAGONAL_PACKING: 3,
+    }
+    expected = expected_neighbors.get(layout.pattern_kind)
+    topology_ok = True
+    if expected is not None:
+        observed = statistics["core_neighbor_count_max"]
+        topology_ok = observed == expected
+
+    return {
+        "pattern_kind": layout.pattern_kind,
+        "hole_count": layout.hole_count,
+        "pitch_nominal_mm": layout.pitch_nominal_mm,
+        "pitch_to_diameter_ratio": layout.pitch_nominal_mm / layout.diameter_mm,
+        "diameter_mm": layout.diameter_mm,
+        "nearest_neighbor_min_mm": statistics["nearest_neighbor_min_mm"],
+        "nearest_neighbor_mean_mm": statistics["nearest_neighbor_mean_mm"],
+        "core_neighbor_count_mean": statistics["core_neighbor_count_mean"],
+        "core_neighbor_count_max": statistics["core_neighbor_count_max"],
+        "expected_core_neighbors": expected if expected is not None else "",
+        "edge_clearance_mm": edge_clearance_mm,
+        "analytic_area_fraction": layout.analytic_area_fraction,
+        "ring_count": layout.ring_count,
+        "holes_per_ring": "|".join(str(value) for value in layout.holes_per_ring),
+        "ring_radii_mm": "|".join(
+            f"{value:.6f}" for value in layout.ring_radii_mm
+        ),
+        "geometry_ok": geometry_ok,
+        "topology_ok": topology_ok,
+        "notes": layout.notes,
+    }
 #
 # ============================================================================
 # 17. Git 提交与推送规范：小步提交，多角度详细提交信息
