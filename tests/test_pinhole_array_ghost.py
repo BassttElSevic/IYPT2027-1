@@ -13,6 +13,21 @@ from typing import Any
 import cupy as cp
 
 from pinhole_array_ghost import (
+    accumulate_shifted_kernels,
+    build_diameter_anchor_grid,
+    build_psf_cache,
+    build_solar_directions,
+    build_solar_disk_kernel,
+    circle_overlap_area_mm2,
+    compute_hole_weights,
+    convolve_with_solar_disk,
+    integrate_solar_source_direct,
+    load_previous_diameter_anchors,
+    measure_image_width_arcmin,
+    plan_field_grid,
+    resample_psf_to_grid,
+)
+from pinhole_array_ghost import (
     ARRAY_PATTERN_SQUARE_PACKING,
     ARRAY_PATTERN_TRIANGULAR_PACKING,
     ArrayGhostSimulationConfig,
@@ -251,6 +266,576 @@ def single_hole_layout(diameter_mm: float):
         analytic_area_fraction=math.nan,
         notes="single hole coverage probe",
     )
+
+
+class CircleOverlapTest(unittest.TestCase):
+    def test_disjoint_circles_have_zero_overlap(self) -> None:
+        self.assertAlmostEqual(
+            circle_overlap_area_mm2(10.0, 1.0, 1.0),
+            0.0,
+            places=12,
+        )
+
+    def test_fully_contained_circle_returns_smaller_area(self) -> None:
+        expected = math.pi * 0.5**2
+        self.assertAlmostEqual(
+            circle_overlap_area_mm2(0.1, 0.5, 3.0),
+            expected,
+            places=12,
+        )
+
+    def test_identical_circles_have_full_area(self) -> None:
+        expected = math.pi * 1.0**2
+        self.assertAlmostEqual(
+            circle_overlap_area_mm2(0.0, 1.0, 1.0),
+            expected,
+            places=12,
+        )
+
+    def test_half_overlap_of_equal_circles(self) -> None:
+        # 两个等半径圆的交叠面积等于半径时，交叠约为 1.2284 r^2。
+        overlap = circle_overlap_area_mm2(1.0, 1.0, 1.0)
+        self.assertAlmostEqual(overlap / (math.pi * 1.0**2), 0.3910, places=4)
+
+    def test_overlap_is_monotone_decreasing_with_distance(self) -> None:
+        distances = [0.0, 0.2, 0.5, 1.0, 1.5, 1.9]
+        overlaps = [
+            circle_overlap_area_mm2(value, 1.0, 1.0) for value in distances
+        ]
+        self.assertTrue(
+            all(a >= b for a, b in zip(overlaps, overlaps[1:])),
+            overlaps,
+        )
+
+
+class HoleWeightTest(unittest.TestCase):
+    def test_infinite_pupil_model_gives_unit_weights(self) -> None:
+        config = ArrayGhostSimulationConfig()
+        layout = generate_square_packing(config, 2.0, 0.7)
+        weights, model = compute_hole_weights(layout, None, config)
+
+        self.assertEqual(model, "infinite_pupil_upper_bound")
+        self.assertTrue((weights == 1.0).all())
+
+    def test_pupil_model_attenuates_off_axis_holes(self) -> None:
+        config = replace(
+            ArrayGhostSimulationConfig(),
+            enable_pupil_vignetting=True,
+            pupil_plane_distance_mm=12.0,
+        )
+        layout = generate_square_packing(config, 2.0, 0.7)
+        weights, model = compute_hole_weights(layout, 2.0, config)
+        import numpy as np
+
+        centre_index = int(np.argmin((layout.centers_mm**2).sum(axis=1)))
+        self.assertEqual(model, "quasi_static_pupil")
+        self.assertAlmostEqual(weights[centre_index], 1.0, places=12)
+        # 瞳孔直径 2 mm 时，偏离超过 1 mm 的孔完全被挡掉。
+        self.assertTrue((weights >= 0.0).all())
+        self.assertTrue((weights <= 1.0 + 1e-12).all())
+        self.assertTrue((weights < 1.0).any())
+
+
+class PsfCacheTest(unittest.TestCase):
+    def test_repeated_key_hits_cache_without_recompute(self) -> None:
+        config = ArrayGhostSimulationConfig()
+        cache = build_psf_cache(config)
+
+        first, sampling_first = cache.get(config, 0.7, 3.0, 550.0)
+        second, sampling_second = cache.get(config, 0.7, 3.0, 550.0)
+
+        self.assertEqual(cache.compute_count, 1)
+        self.assertEqual(cache.hit_count, 1)
+        self.assertTrue(first is second)
+        self.assertAlmostEqual(
+            sampling_first.angular_pixel_arcmin,
+            sampling_second.angular_pixel_arcmin,
+            places=12,
+        )
+
+    def test_distinct_key_triggers_new_compute(self) -> None:
+        config = ArrayGhostSimulationConfig()
+        cache = build_psf_cache(config)
+
+        cache.get(config, 0.7, 3.0, 550.0)
+        cache.get(config, 0.7, 3.0, 600.0)
+
+        self.assertEqual(cache.compute_count, 2)
+        self.assertEqual(cache.hit_count, 0)
+
+    def test_psf_is_normalised_to_one(self) -> None:
+        config = ArrayGhostSimulationConfig()
+        cache = build_psf_cache(config)
+        psf, _ = cache.get(config, 0.7, 3.0, 550.0)
+
+        self.assertAlmostEqual(
+            float(psf.sum(dtype=config.accumulator_dtype)),
+            1.0,
+            places=6,
+        )
+
+
+class ResamplingTest(unittest.TestCase):
+    def test_identity_resampling_keeps_centre_and_energy(self) -> None:
+        config = ArrayGhostSimulationConfig()
+        axis = cp.arange(64, dtype=cp.float32) - 32
+        source = cp.exp(-((axis[:, None] ** 2 + axis[None, :] ** 2) / 8.0))
+        source = source / source.sum()
+
+        resampled = resample_psf_to_grid(source, 0.25, 64, 0.25, config)
+        peak_y, peak_x = [
+            int(value.get()) for value in cp.unravel_index(resampled.argmax(), resampled.shape)
+        ]
+
+        self.assertEqual((peak_y, peak_x), (32, 32))
+        self.assertAlmostEqual(
+            float(resampled.sum(dtype=config.accumulator_dtype)),
+            1.0,
+            places=6,
+        )
+
+    def test_half_pixel_shift_moves_peak_by_one_source_pixel(self) -> None:
+        config = ArrayGhostSimulationConfig()
+        axis = cp.arange(64, dtype=cp.float32) - 32
+        source = cp.zeros((64, 64), dtype=cp.float32)
+        source[32, 32] = 1.0
+
+        # 目标角分辨率是源的两倍，源上一像素对应目标两像素。
+        resampled = resample_psf_to_grid(source, 0.25, 64, 0.5, config)
+        self.assertEqual(float(resampled.sum()), 1.0)
+        self.assertGreater(float(resampled[32, 32]), 0.0)
+
+
+class SolarDiskTest(unittest.TestCase):
+    def test_disk_kernel_sums_to_one(self) -> None:
+        config = ArrayGhostSimulationConfig()
+        kernel, metadata = build_solar_disk_kernel(
+            config, 256, config.analysis_pixel_arcmin
+        )
+
+        self.assertAlmostEqual(metadata["weight_sum"], 1.0, places=6)
+        self.assertLess(
+            abs(metadata["weight_sum"] - 1.0),
+            config.solar_weight_sum_tolerance,
+        )
+
+    def test_disk_kernel_matches_analytic_area_fraction(self) -> None:
+        config = ArrayGhostSimulationConfig()
+        _kernel, metadata = build_solar_disk_kernel(
+            config, 256, config.analysis_pixel_arcmin
+        )
+        analytic = metadata["analytic_disk_fraction_of_window"]
+        numeric = metadata["numeric_disk_fraction_of_window"]
+
+        self.assertLess(abs(numeric - analytic) / analytic, 0.01)
+
+    def test_disk_kernel_is_symmetric(self) -> None:
+        config = ArrayGhostSimulationConfig()
+        kernel, _ = build_solar_disk_kernel(
+            config, 256, config.analysis_pixel_arcmin
+        )
+
+        # 偶数网格的中心约定是 coordinate_i = (i - N/2) * pixel，
+        # 因此关于中心坐标的镜像对应下标映射 i -> (N - i) mod N，
+        # 也就是先反转数组，再整体滚动一个像素。
+        flipped_y = cp.roll(kernel[::-1, :], 1, axis=0)
+        flipped_x = cp.roll(kernel[:, ::-1], 1, axis=1)
+        self.assertLess(float(cp.abs(kernel - flipped_y).max()), 1e-12)
+        self.assertLess(float(cp.abs(kernel - flipped_x).max()), 1e-12)
+
+    def test_solar_direction_weights_sum_to_one(self) -> None:
+        config = ArrayGhostSimulationConfig()
+        directions, weights = build_solar_directions(config)
+
+        self.assertAlmostEqual(float(weights.sum()), 1.0, places=9)
+        radii = cp.sqrt((directions**2).sum(axis=1))
+        self.assertLessEqual(
+            float(radii.max()),
+            config.solar_angular_radius_arcmin + 1e-6,
+        )
+
+    def test_analysis_grid_must_cover_solar_disk(self) -> None:
+        config = ArrayGhostSimulationConfig()
+        with self.assertRaises(ValueError):
+            build_solar_disk_kernel(config, 32, config.analysis_pixel_arcmin)
+
+
+class SolarIntegrationEquivalenceTest(unittest.TestCase):
+    """V-G：圆盘卷积与稠密方向积分必须给出同一个太阳扩展源结果。"""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.config = ArrayGhostSimulationConfig()
+        cls.cache = build_psf_cache(cls.config)
+        psf, sampling = cls.cache.get(cls.config, 0.6354, 3.0, 550.0)
+        grid_size = 256
+        cls.grid = resample_psf_to_grid(
+            psf,
+            sampling.angular_pixel_arcmin,
+            grid_size,
+            cls.config.analysis_pixel_arcmin,
+            cls.config,
+        )
+        cls.disk, _ = build_solar_disk_kernel(
+            cls.config, grid_size, cls.config.analysis_pixel_arcmin
+        )
+        cls.convolved, _ = convolve_with_solar_disk(
+            cls.grid, cls.disk, cls.config
+        )
+
+    def test_convolution_preserves_total_energy(self) -> None:
+        self.assertAlmostEqual(
+            float(self.convolved.sum(dtype=self.config.accumulator_dtype)),
+            1.0,
+            places=6,
+        )
+
+    def test_dense_direction_sum_matches_convolution_width(self) -> None:
+        directions, weights = build_solar_directions(
+            self.config,
+            self.config.solar_radial_ring_dense_count,
+            self.config.solar_azimuth_dense_count,
+        )
+        direct = integrate_solar_source_direct(
+            self.grid,
+            directions,
+            weights,
+            self.config.analysis_pixel_arcmin,
+            self.config,
+        )
+        width_conv = measure_image_width_arcmin(
+            self.convolved,
+            self.config.analysis_pixel_arcmin,
+            self.config.sun_width_energy_fraction,
+            self.config,
+        )
+        width_direct = measure_image_width_arcmin(
+            direct,
+            self.config.analysis_pixel_arcmin,
+            self.config.sun_width_energy_fraction,
+            self.config,
+        )
+
+        relative_difference_percent = (
+            100.0 * abs(width_conv - width_direct) / width_conv
+        )
+        self.assertLess(
+            relative_difference_percent,
+            self.config.solar_convergence_width_tolerance_percent,
+        )
+
+    def test_dense_direction_sum_peak_matches_convolution(self) -> None:
+        directions, weights = build_solar_directions(
+            self.config,
+            self.config.solar_radial_ring_dense_count,
+            self.config.solar_azimuth_dense_count,
+        )
+        direct = integrate_solar_source_direct(
+            self.grid,
+            directions,
+            weights,
+            self.config.analysis_pixel_arcmin,
+            self.config,
+        )
+        peak_conv = float(self.convolved.max())
+        peak_direct = float(direct.max())
+        relative_difference_percent = (
+            100.0 * abs(peak_conv - peak_direct) / peak_conv
+        )
+
+        self.assertLess(
+            relative_difference_percent,
+            self.config.solar_convergence_peak_tolerance_percent,
+        )
+
+    def test_standard_direction_sum_width_matches_convolution(self) -> None:
+        directions, weights = build_solar_directions(self.config)
+        direct = integrate_solar_source_direct(
+            self.grid,
+            directions,
+            weights,
+            self.config.analysis_pixel_arcmin,
+            self.config,
+        )
+        width_conv = measure_image_width_arcmin(
+            self.convolved,
+            self.config.analysis_pixel_arcmin,
+            self.config.sun_width_energy_fraction,
+            self.config,
+        )
+        width_direct = measure_image_width_arcmin(
+            direct,
+            self.config.analysis_pixel_arcmin,
+            self.config.sun_width_energy_fraction,
+            self.config,
+        )
+
+        relative_difference_percent = (
+            100.0 * abs(width_conv - width_direct) / width_conv
+        )
+        self.assertLess(
+            relative_difference_percent,
+            self.config.solar_convergence_width_tolerance_percent,
+        )
+
+
+class ArrayImageTest(unittest.TestCase):
+    """V-B、V-D、V-E、V-F：平移、单孔退化、双孔对称与能量守恒。"""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.config = ArrayGhostSimulationConfig().quick_variant()
+        cls.cache = build_psf_cache(cls.config)
+        psf, sampling = cls.cache.get(cls.config, 0.6354, 3.0, 550.0)
+        grid_size = cls.config.effective_analysis_grid_size()
+        cls.kernel = resample_psf_to_grid(
+            psf,
+            sampling.angular_pixel_arcmin,
+            grid_size,
+            cls.config.analysis_pixel_arcmin,
+            cls.config,
+        )
+        cls.width_arcmin = measure_image_width_arcmin(
+            cls.kernel,
+            cls.config.analysis_pixel_arcmin,
+            cls.config.sun_width_energy_fraction,
+            cls.config,
+        )
+
+    def _shifts(self, centers_mm):
+        return cp.asarray(
+            centers_mm
+            / self.config.focal_length_mm
+            * (180.0 * 60.0 / math.pi),
+            dtype=cp.float32,
+        )
+
+    def test_single_hole_degrades_to_the_kernel(self) -> None:
+        layout = generate_square_packing(self.config, 4.0, 0.7)
+        shifts = self._shifts(layout.centers_mm)
+        import numpy as np
+
+        centre_index = int(np.argmin((layout.centers_mm**2).sum(axis=1)))
+        one_shift = shifts[centre_index : centre_index + 1]
+        weights = cp.ones((1,), dtype=self.config.accumulator_dtype)
+        field = plan_field_grid(one_shift, self.width_arcmin, self.config)
+        result = accumulate_shifted_kernels(
+            self.kernel,
+            self.config.analysis_pixel_arcmin,
+            one_shift,
+            weights,
+            field,
+            self.config,
+        )
+
+        self.assertAlmostEqual(result["total_energy"], 1.0, places=6)
+        peak_y, peak_x = [
+            int(value.get())
+            for value in cp.unravel_index(result["image"].argmax(), result["image"].shape)
+        ]
+        self.assertEqual((peak_y, peak_x), (field["grid_size"] // 2,) * 2)
+
+    def test_array_energy_equals_weight_sum(self) -> None:
+        layout = generate_square_packing(self.config, 4.0, 0.7)
+        shifts = self._shifts(layout.centers_mm)
+        weights = cp.ones(
+            (shifts.shape[0],), dtype=self.config.accumulator_dtype
+        )
+        field = plan_field_grid(shifts, self.width_arcmin, self.config)
+        result = accumulate_shifted_kernels(
+            self.kernel,
+            self.config.analysis_pixel_arcmin,
+            shifts,
+            weights,
+            field,
+            self.config,
+        )
+
+        self.assertAlmostEqual(
+            result["total_energy"],
+            result["expected_energy"],
+            places=6,
+        )
+        self.assertAlmostEqual(result["expected_energy"], float(layout.hole_count))
+
+    def test_half_weight_halves_that_ghost_peak(self) -> None:
+        layout = generate_square_packing(self.config, 4.0, 0.7)
+        shifts = self._shifts(layout.centers_mm)
+        weights = cp.ones(
+            (shifts.shape[0],), dtype=self.config.accumulator_dtype
+        )
+        field = plan_field_grid(shifts, self.width_arcmin, self.config)
+        reference = accumulate_shifted_kernels(
+            self.kernel,
+            self.config.analysis_pixel_arcmin,
+            shifts,
+            weights,
+            field,
+            self.config,
+        )
+
+        halved = weights.copy()
+        halved[1] = 0.5
+        modified = accumulate_shifted_kernels(
+            self.kernel,
+            self.config.analysis_pixel_arcmin,
+            shifts,
+            halved,
+            field,
+            self.config,
+        )
+        self.assertAlmostEqual(
+            modified["total_energy"],
+            reference["total_energy"] - 0.5,
+            places=6,
+        )
+
+    def test_two_symmetric_holes_produce_symmetric_image(self) -> None:
+        import numpy as np
+
+        centers_mm = np.array([[-1.0, 0.0], [1.0, 0.0]], dtype=np.float64)
+        shifts = self._shifts(centers_mm)
+        weights = cp.ones((2,), dtype=self.config.accumulator_dtype)
+        field = plan_field_grid(shifts, self.width_arcmin, self.config)
+        result = accumulate_shifted_kernels(
+            self.kernel,
+            self.config.analysis_pixel_arcmin,
+            shifts,
+            weights,
+            field,
+            self.config,
+        )
+        image = result["image"]
+
+        # 两个等亮孔必须给出关于视场中心对称的一对像。峰位不落在整数
+        # 像素上时双线性插值会引入微小不对称，因此这里检查能量对称与
+        # 峰位等距，而不是逐像素完全相等。
+        centre = field["grid_size"] // 2
+        left_energy = float(image[:, :centre].sum())
+        right_energy = float(image[:, centre + 1 :].sum())
+        self.assertAlmostEqual(
+            left_energy / right_energy,
+            1.0,
+            places=4,
+        )
+        vertical_axis = cp.arange(field["grid_size"]) - centre
+        peak_columns = [
+            int(value.get())
+            for value in cp.argsort(image.max(axis=0))[-2:]
+        ]
+        self.assertAlmostEqual(
+            abs(vertical_axis[peak_columns[0]].item()),
+            abs(vertical_axis[peak_columns[1]].item()),
+            delta=1.0,
+        )
+        self.assertAlmostEqual(result["total_energy"], 2.0, places=6)
+
+    def test_shift_places_peak_at_pitch_over_focal_length(self) -> None:
+        import numpy as np
+
+        pitch_mm = 2.0
+        centers_mm = np.array([[-0.5 * pitch_mm, 0.0]], dtype=np.float64)
+        shifts = self._shifts(centers_mm)
+        expected_arcmin = (
+            pitch_mm / self.config.focal_length_mm * (180.0 * 60.0 / math.pi) * 0.5
+        )
+        self.assertAlmostEqual(
+            abs(float(shifts[0, 0])),
+            expected_arcmin,
+            places=3,
+        )
+
+        weights = cp.ones((1,), dtype=self.config.accumulator_dtype)
+        field = plan_field_grid(shifts, self.width_arcmin, self.config)
+        result = accumulate_shifted_kernels(
+            self.kernel,
+            self.config.analysis_pixel_arcmin,
+            shifts,
+            weights,
+            field,
+            self.config,
+        )
+        peak_y, peak_x = [
+            int(value.get())
+            for value in cp.unravel_index(result["image"].argmax(), result["image"].shape)
+        ]
+        centre = field["grid_size"] // 2
+        expected_pixel = centre + int(
+            round(float(shifts[0, 0]) / field["pixel_arcmin"])
+        )
+        self.assertAlmostEqual(
+            abs(peak_x - centre),
+            abs(expected_pixel - centre),
+            delta=1,
+        )
+        self.assertEqual(peak_y, centre)
+
+
+class AnchorReuseTest(unittest.TestCase):
+    def test_anchors_exclude_zero_myopia(self) -> None:
+        config = ArrayGhostSimulationConfig()
+        anchors = load_previous_diameter_anchors(config)
+
+        self.assertNotIn(0.0, anchors["retinal_optimal_mm"])
+        self.assertNotIn(0.0, anchors["psf_optimal_mm"])
+
+    def test_retinal_anchor_matches_readme_value(self) -> None:
+        config = ArrayGhostSimulationConfig()
+        anchors = load_previous_diameter_anchors(config)
+
+        # README：M = 3 D 时第二阶段最优孔径约 0.635 mm。
+        self.assertAlmostEqual(
+            anchors["retinal_optimal_mm"][3.0],
+            0.635,
+            places=3,
+        )
+
+    def test_anchor_grid_scales_around_reference(self) -> None:
+        config = ArrayGhostSimulationConfig()
+        anchors = load_previous_diameter_anchors(config)
+        reference_mm, source = m_reference(config, anchors)
+
+        values, grid_source = build_diameter_anchor_grid(
+            config, anchors, 3.0, 550.0
+        )
+        self.assertEqual(grid_source, source)
+        self.assertAlmostEqual(min(values), reference_mm * 0.8, places=6)
+        self.assertAlmostEqual(max(values), reference_mm * 1.2, places=6)
+
+    def test_anchor_grid_deduplicates_within_tolerance(self) -> None:
+        config = replace(
+            ArrayGhostSimulationConfig(),
+            diameter_anchor_factors=(1.0, 1.0 + 1e-9, 1.2),
+        )
+        anchors = load_previous_diameter_anchors(config)
+        values, _ = build_diameter_anchor_grid(config, anchors, 3.0, 550.0)
+
+        self.assertEqual(len(values), 2)
+
+    def test_missing_anchor_is_reported(self) -> None:
+        config = ArrayGhostSimulationConfig()
+        anchors = load_previous_diameter_anchors(config)
+        with self.assertRaises(KeyError):
+            build_diameter_anchor_grid(config, anchors, 99.0, 550.0)
+
+    def test_debug_mode_falls_back_to_theoretical_diameter(self) -> None:
+        config = replace(
+            ArrayGhostSimulationConfig(),
+            reuse_previous_metrics=False,
+            reuse_debug_label="debug_recompute",
+        )
+        anchors = load_previous_diameter_anchors(config)
+        values, source = build_diameter_anchor_grid(config, anchors, 99.0, 550.0)
+
+        self.assertEqual(source, "theoretical_fallback_debug")
+        self.assertGreater(len(values), 0)
+
+
+def m_reference(config, anchors):
+    """取 M = 3 D 的主锚点与来源，供锚点邻域测试复用。"""
+    from pinhole_array_ghost import reference_diameter_mm
+
+    return reference_diameter_mm(config, anchors, 3.0, 550.0)
 
 
 class SquarePackingTest(unittest.TestCase):

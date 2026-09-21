@@ -938,6 +938,7 @@ from single_hole_PSF import (
     configure_bilingual_plot_font,
     enclosing_diameter_arcmin,
     radial_bin_sum,
+    theoretical_optimal_diameter_mm,
 )
 
 
@@ -1027,6 +1028,7 @@ class ArrayGhostSimulationConfig:
     psf_myopia_column: str = "myopia_d"
     psf_wavelength_column: str = "wavelength_nm"
     reference_anchor_wavelength_nm: float = 550.0
+    exclude_zero_myopia_from_anchors: bool = True
     crosscheck_anchor_myopia_values_d: tuple[float, ...] = (1.0, 2.0, 3.0, 4.0, 6.0)
     diameter_anchor_factors: tuple[float, ...] = (0.8, 0.9, 1.0, 1.1, 1.2)
     coarse_diameter_check_factors: tuple[float, ...] = (0.5, 0.7, 1.5, 2.0)
@@ -1076,11 +1078,16 @@ class ArrayGhostSimulationConfig:
     # ------------------------------------------------------------ 光源参数
     source_kind: str = SOURCE_KIND_SOLAR_DISK
     solar_angular_diameter_deg: float = 0.53
-    solar_radial_ring_count: int = 8
-    solar_azimuth_sample_count: int = 16
-    solar_radial_ring_dense_count: int = 16
-    solar_azimuth_dense_count: int = 32
+    # 方向积分只用于 V-G 校验。实测峰值随采样数约按 1/n 收敛：
+    # 8x16 时峰高偏离 35%，32x64 偏离 2.8%，96x192 偏离 0.26%。
+    # 因此主路径固定为面积加权的圆盘卷积，方向积分用稠密档复核。
+    solar_radial_ring_count: int = 32
+    solar_azimuth_sample_count: int = 64
+    solar_radial_ring_dense_count: int = 96
+    solar_azimuth_dense_count: int = 192
     solar_weight_sum_tolerance: float = 1.0e-6
+    solar_convergence_peak_tolerance_percent: float = 2.0
+    solar_convergence_width_tolerance_percent: float = 2.0
     spectral_wavelengths_nm: tuple[float, ...] = (
         400.0,
         450.0,
@@ -1097,6 +1104,7 @@ class ArrayGhostSimulationConfig:
     solar_kernel_half_width_arcmin: float = 64.0
     field_pixel_arcmin: float = 0.25
     field_grid_max_size: int = 2048
+    field_min_pixels_per_image_width: float = 6.0
     field_margin_factor: float = 1.05
     field_extra_margin_arcmin: float = 32.0
     psf_resampling_order: int = 1
@@ -1316,6 +1324,7 @@ def validate_config(config: ArrayGhostSimulationConfig) -> None:
         "merge_radius_factor": config.merge_radius_factor,
         "separation_ratio_threshold": config.separation_ratio_threshold,
         "sun_width_energy_fraction": config.sun_width_energy_fraction,
+        "field_min_pixels_per_image_width": config.field_min_pixels_per_image_width,
         "figure_dpi": float(config.figure_dpi),
     }
     for name, value in positive_scalars.items():
@@ -1336,6 +1345,17 @@ def validate_config(config: ArrayGhostSimulationConfig) -> None:
         )
     if config.visibility_peak_threshold <= 0.0:
         raise ValueError("visibility_peak_threshold must be positive")
+    for name in (
+        "solar_convergence_peak_tolerance_percent",
+        "solar_convergence_width_tolerance_percent",
+    ):
+        if getattr(config, name) <= 0.0:
+            raise ValueError(f"{name} must be positive")
+    if config.field_min_pixels_per_image_width < 2.0:
+        raise ValueError(
+            "field_min_pixels_per_image_width must be at least 2 so that a "
+            "single-hole image is not collapsed into one pixel"
+        )
     if config.quick_mode and config.reuse_previous_metrics is False:
         # quick 模式也必须在正式结论中复用前两阶段锚点。
         raise ValueError("quick mode still requires reuse_previous_metrics")
@@ -2276,6 +2296,747 @@ def validate_mask(
         "mask_pixel_count": mask.pixel_count,
         "mask_ok": not fail_reasons,
         "fail_reasons": "|".join(fail_reasons),
+    }
+
+
+# ============================================================================
+# 实现部分 4/5：光学链路（锚点复用、PSF 缓存、太阳盘、平移叠加）
+# ============================================================================
+#
+# 本节的物理模型完全继承第一阶段：
+#   - 单孔 PSF 由 compute_psf 给出，不重新实现圆孔、离焦波前或 FFT；
+#   - 孔间按强度叠加，不建立任何复振幅互相关；
+#   - 太阳盘积分用面积权重，等价于与离散化圆盘核做卷积，
+#     但两种实现必须互相复算（V-G）。
+
+
+def _read_metric_rows(path: Path) -> list[dict[str, str]]:
+    with path.open("r", newline="", encoding="utf-8") as file:
+        return list(csv.DictReader(file))
+
+
+def _optimal_diameter_from_rows(
+    rows: Iterable[dict[str, str]],
+    wavelength_column: str,
+    myopia_column: str,
+    diameter_column: str,
+    metric_column: str,
+    wavelength_nm: float,
+) -> tuple[dict[float, float], dict[float, float]]:
+    """按 (波长, 近视) 分组，取指标最小的一行作为该组最优孔径。"""
+    best_metric: dict[float, float] = {}
+    best_diameter: dict[float, float] = {}
+    for row in rows:
+        try:
+            row_wavelength_nm = float(row[wavelength_column])
+            myopia_d = float(row[myopia_column])
+            diameter_mm = float(row[diameter_column])
+            metric_value = float(row[metric_column])
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError(
+                f"cannot parse previous-stage row for {metric_column}: {row!r}"
+            ) from error
+        if not math.isclose(
+            row_wavelength_nm, wavelength_nm, abs_tol=1.0e-6
+        ):
+            continue
+        if not math.isfinite(metric_value):
+            continue
+        if myopia_d <= 0.0:
+            # 0 D 没有离焦，理论最优孔径无有限解，不作为第三步锚点。
+            continue
+        if myopia_d not in best_metric or metric_value < best_metric[myopia_d]:
+            best_metric[myopia_d] = metric_value
+            best_diameter[myopia_d] = diameter_mm
+    return best_diameter, best_metric
+
+
+def load_previous_diameter_anchors(
+    config: ArrayGhostSimulationConfig,
+) -> dict[str, Any]:
+    """方案 0.4 与 4.1：读取前两阶段最优孔径，作为本阶段的主锚点。
+
+    正式结论要求 reuse_previous_metrics=True。只有在显式给出调试标签时
+    才允许缺锚点，并在后续用理论最优孔径兜底。
+    """
+    repository_root = Path(__file__).resolve().parent
+    retinal_path = repository_root / config.retinal_metrics_relative_path
+    psf_path = repository_root / (
+        config.psf_metrics_relative_path_template.format(
+            wavelength_nm=config.reference_anchor_wavelength_nm
+        )
+    )
+
+    anchors: dict[str, Any] = {
+        "retinal_source": str(config.retinal_metrics_relative_path),
+        "psf_source": str(
+            config.psf_metrics_relative_path_template.format(
+                wavelength_nm=config.reference_anchor_wavelength_nm
+            )
+        ),
+        "retinal_optimal_mm": {},
+        "retinal_metric": {},
+        "psf_optimal_mm": {},
+        "psf_metric": {},
+    }
+
+    if retinal_path.exists():
+        rows = _read_metric_rows(retinal_path)
+        diameters, metrics = _optimal_diameter_from_rows(
+            rows,
+            config.retinal_wavelength_column,
+            config.retinal_myopia_column,
+            config.retinal_diameter_column,
+            config.retinal_threshold_column,
+            config.reference_anchor_wavelength_nm,
+        )
+        anchors["retinal_optimal_mm"] = diameters
+        anchors["retinal_metric"] = metrics
+        anchors["retinal_row_count"] = len(rows)
+    elif config.reuse_previous_metrics:
+        raise FileNotFoundError(
+            "second-stage metrics are required for anchor reuse: "
+            f"{retinal_path}"
+        )
+
+    if psf_path.exists():
+        rows = _read_metric_rows(psf_path)
+        diameters, metrics = _optimal_diameter_from_rows(
+            rows,
+            config.psf_wavelength_column,
+            config.psf_myopia_column,
+            config.psf_diameter_column,
+            config.psf_metric_column,
+            config.reference_anchor_wavelength_nm,
+        )
+        anchors["psf_optimal_mm"] = diameters
+        anchors["psf_metric"] = metrics
+        anchors["psf_row_count"] = len(rows)
+    elif config.reuse_previous_metrics:
+        raise FileNotFoundError(
+            "first-stage metrics are required for cross-check anchors: "
+            f"{psf_path}"
+        )
+
+    return anchors
+
+
+def build_anchor_rows(
+    config: ArrayGhostSimulationConfig,
+    anchors: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """方案第 9 节：previous_diameter_anchors.csv 的每一行。"""
+    rows: list[dict[str, Any]] = []
+    myopia_values = sorted(
+        set(anchors["retinal_optimal_mm"]) | set(anchors["psf_optimal_mm"])
+    )
+    for myopia_d in myopia_values:
+        retinal_diameter = anchors["retinal_optimal_mm"].get(myopia_d)
+        psf_diameter = anchors["psf_optimal_mm"].get(myopia_d)
+        if retinal_diameter is not None and psf_diameter is not None:
+            relative_difference_percent = (
+                100.0 * (retinal_diameter - psf_diameter) / psf_diameter
+            )
+            reuse_status = "retinal_primary_with_psf_crosscheck"
+        elif retinal_diameter is not None:
+            relative_difference_percent = math.nan
+            reuse_status = "retinal_primary_only"
+        elif psf_diameter is not None:
+            relative_difference_percent = math.nan
+            reuse_status = "psf_crosscheck_only"
+        else:
+            relative_difference_percent = math.nan
+            reuse_status = "missing"
+        rows.append(
+            {
+                "wavelength_nm": config.reference_anchor_wavelength_nm,
+                "myopia_d": myopia_d,
+                "retinal_d_opt_mm": (
+                    retinal_diameter if retinal_diameter is not None else math.nan
+                ),
+                "retinal_metric": anchors["retinal_metric"].get(myopia_d, math.nan),
+                "psf_d50_d_opt_mm": (
+                    psf_diameter if psf_diameter is not None else math.nan
+                ),
+                "psf_metric": anchors["psf_metric"].get(myopia_d, math.nan),
+                "relative_difference_percent": relative_difference_percent,
+                "reuse_status": reuse_status,
+                "reuse_previous_metrics": config.reuse_previous_metrics,
+            }
+        )
+    return rows
+
+
+def reference_diameter_mm(
+    config: ArrayGhostSimulationConfig,
+    anchors: dict[str, Any],
+    myopia_d: float,
+    wavelength_nm: float,
+) -> tuple[float, str]:
+    """给出该近视度数的主锚点孔径，并说明来源。"""
+    if math.isclose(
+        wavelength_nm,
+        config.reference_anchor_wavelength_nm,
+        abs_tol=1.0e-6,
+    ):
+        retinal_diameter = anchors["retinal_optimal_mm"].get(myopia_d)
+        if retinal_diameter is not None:
+            return retinal_diameter, "retinal_optotype_primary"
+        psf_diameter = anchors["psf_optimal_mm"].get(myopia_d)
+        if psf_diameter is not None:
+            return psf_diameter, "psf_d50_crosscheck"
+    if not config.reuse_previous_metrics:
+        return (
+            theoretical_optimal_diameter_mm(config.psf_config, wavelength_nm, myopia_d),
+            "theoretical_fallback_debug",
+        )
+    raise KeyError(
+        "no previous-stage anchor for "
+        f"M={myopia_d} D at wavelength {wavelength_nm} nm; "
+        "extend the anchor table instead of silently scanning the full range"
+    )
+
+
+def build_diameter_anchor_grid(
+    config: ArrayGhostSimulationConfig,
+    anchors: dict[str, Any],
+    myopia_d: float,
+    wavelength_nm: float,
+) -> tuple[tuple[float, ...], str]:
+    """方案 0.4 与 2.9 节：d_opt 邻域，而非全范围重扫孔径。"""
+    reference_mm, source = reference_diameter_mm(
+        config, anchors, myopia_d, wavelength_nm
+    )
+    values: list[float] = []
+    for factor in config.effective_diameter_anchor_factors():
+        values.append(reference_mm * factor)
+    deduplicated: list[float] = []
+    for value in sorted(values):
+        if (
+            not deduplicated
+            or abs(value - deduplicated[-1])
+            > config.diameter_deduplication_tolerance_mm
+        ):
+            deduplicated.append(value)
+    return tuple(deduplicated), source
+
+
+@dataclass
+class PinholePsfCache:
+    """按 (d, M, lambda) 缓存单孔 PSF，避免重复 FFT。"""
+
+    aperture: Any
+    normalized_radius_squared: Any
+    psf_by_key: dict[tuple[float, float, float], Any] = field(default_factory=dict)
+    sampling_by_key: dict[tuple[float, float, float], Any] = field(
+        default_factory=dict
+    )
+    compute_count: int = 0
+    hit_count: int = 0
+
+    def key(
+        self,
+        diameter_mm: float,
+        myopia_d: float,
+        wavelength_nm: float,
+    ) -> tuple[float, float, float]:
+        # 浮点扫描键统一按固定小数位取整，禁止裸浮点相等。
+        return (
+            round(diameter_mm, 6),
+            round(myopia_d, 6),
+            round(wavelength_nm, 6),
+        )
+
+    def get(
+        self,
+        config: ArrayGhostSimulationConfig,
+        diameter_mm: float,
+        myopia_d: float,
+        wavelength_nm: float,
+    ) -> tuple[Any, Any]:
+        key = self.key(diameter_mm, myopia_d, wavelength_nm)
+        if key in self.psf_by_key:
+            self.hit_count += 1
+            return self.psf_by_key[key], self.sampling_by_key[key]
+        sampling = build_sampling(config.psf_config, wavelength_nm, diameter_mm)
+        psf = compute_psf(
+            config.psf_config,
+            self.aperture,
+            self.normalized_radius_squared,
+            wavelength_nm,
+            diameter_mm,
+            myopia_d,
+        )
+        self.compute_count += 1
+        self.psf_by_key[key] = psf
+        self.sampling_by_key[key] = sampling
+        return psf, sampling
+
+
+def build_psf_cache(config: ArrayGhostSimulationConfig) -> PinholePsfCache:
+    """在 GPU 上一次性建立圆孔与归一化半径网格，供全部扫描点复用。"""
+    with cp.cuda.Device(config.gpu_device_id):
+        (
+            normalized_radius,
+            normalized_radius_squared,
+            _radial_bin_index,
+            _radial_pixel_count,
+        ) = build_gpu_grids(config.psf_config)
+        aperture = build_soft_aperture(config.psf_config, normalized_radius)
+    return PinholePsfCache(
+        aperture=aperture,
+        normalized_radius_squared=normalized_radius_squared,
+    )
+
+
+def resample_psf_to_grid(
+    values: Any,
+    source_pixel_arcmin: float,
+    target_size: int,
+    target_pixel_arcmin: float,
+    config: ArrayGhostSimulationConfig,
+) -> Any:
+    """把任意以角坐标为单位的阵列重采样到目标网格。
+
+    中心约定沿用第二阶段：显式角坐标映射，中心像素严格对应中心像素，
+    不做任何预先 ifftshift；重采样后按总能量归一化。
+    """
+    source_size = int(values.shape[0])
+    centre = source_size // 2
+    target_axis = (
+        cp.arange(target_size, dtype=cp.float32) - target_size // 2
+    ) * (target_pixel_arcmin / source_pixel_arcmin)
+    source_axis = target_axis + centre
+    source_y, source_x = cp.meshgrid(source_axis, source_axis, indexing="ij")
+    resampled = map_coordinates(
+        values,
+        cp.stack((source_y, source_x), axis=0),
+        order=config.psf_resampling_order,
+        mode="constant",
+        cval=0.0,
+    )
+    energy = resampled.sum(dtype=config.accumulator_dtype)
+    if float(energy) > 0.0:
+        resampled = resampled / energy
+    return resampled.astype(config.real_dtype)
+
+
+def build_solar_disk_kernel(
+    config: ArrayGhostSimulationConfig,
+    grid_size: int,
+    pixel_arcmin: float,
+) -> tuple[Any, dict[str, Any]]:
+    """在目标网格上离散化太阳圆盘，得到面积权重核。
+
+    每个像素的权重是该像素被太阳圆盘覆盖的面积占比；子采样密度由
+    aperture_anti_alias_subsamples 控制。归一化后总和为 1。
+    """
+    radius_arcmin = config.solar_angular_radius_arcmin
+    if radius_arcmin > config.solar_kernel_half_width_arcmin:
+        raise ValueError(
+            "solar_kernel_half_width_arcmin must cover the solar radius"
+        )
+    half_width_arcmin = 0.5 * grid_size * pixel_arcmin
+    if radius_arcmin + pixel_arcmin > half_width_arcmin:
+        raise ValueError(
+            "analysis grid is too small for the solar disk: "
+            f"half width {half_width_arcmin:.3f} arcmin, "
+            f"solar radius {radius_arcmin:.3f} arcmin"
+        )
+
+    axis_arcmin = (
+        cp.arange(grid_size, dtype=cp.float32) - grid_size // 2
+    ) * pixel_arcmin
+    grid_x, grid_y = cp.meshgrid(axis_arcmin, axis_arcmin, indexing="xy")
+    subsample_count = config.aperture_anti_alias_subsamples
+    offsets = (
+        cp.arange(subsample_count, dtype=cp.float32) + 0.5
+    ) / subsample_count - 0.5
+    coverage = cp.zeros_like(grid_x)
+    radius_squared = radius_arcmin * radius_arcmin
+    for offset_y in offsets:
+        for offset_x in offsets:
+            distance_squared = (
+                (grid_x + offset_x * pixel_arcmin) ** 2
+                + (grid_y + offset_y * pixel_arcmin) ** 2
+            )
+            coverage += (distance_squared <= radius_squared).astype(
+                config.real_dtype
+            )
+    coverage /= float(subsample_count * subsample_count)
+    total = coverage.sum(dtype=config.accumulator_dtype)
+    if float(total) <= 0.0:
+        raise ValueError("solar disk kernel is empty; check the angular radius")
+    kernel = (coverage / total).astype(config.real_dtype)
+
+    # 解析圆盘面积占比：pi R^2 / 网格窗口面积，用于交叉校验。
+    analytic_fraction = (
+        math.pi * radius_arcmin**2 / (grid_size * pixel_arcmin) ** 2
+    )
+    metadata = {
+        "weight_sum": float(kernel.sum(dtype=config.accumulator_dtype)),
+        "nonzero_pixel_count": int((kernel > 0).sum()),
+        "analytic_disk_fraction_of_window": analytic_fraction,
+        "numeric_disk_fraction_of_window": float(total) / float(grid_size * grid_size),
+        "pixel_arcmin": pixel_arcmin,
+        "grid_size": grid_size,
+    }
+    return kernel, metadata
+
+
+def build_solar_directions(
+    config: ArrayGhostSimulationConfig,
+    radial_count: int | None = None,
+    azimuth_count: int | None = None,
+) -> tuple[Any, Any]:
+    """等面积圆环 + 方位采样的太阳盘方向与权重（V-G 用）。"""
+    radial_samples = (
+        radial_count
+        if radial_count is not None
+        else config.effective_solar_radial_ring_count()
+    )
+    azimuth_samples = (
+        azimuth_count
+        if azimuth_count is not None
+        else config.effective_solar_azimuth_sample_count()
+    )
+    if radial_samples < 1 or azimuth_samples < 1:
+        raise ValueError("solar sampling counts must be positive")
+    radius_arcmin = config.solar_angular_radius_arcmin
+    # 等面积环：每个环的代表半径为 sqrt((k+0.5)/K) * R，权重相同。
+    radial_indices = cp.arange(radial_samples, dtype=cp.float32)
+    ring_radii = radius_arcmin * cp.sqrt(
+        (radial_indices + 0.5) / radial_samples
+    )
+    azimuth_angles = (
+        2.0 * math.pi * cp.arange(azimuth_samples, dtype=cp.float32)
+        / azimuth_samples
+    )
+    radii_grid, angles_grid = cp.meshgrid(
+        ring_radii, azimuth_angles, indexing="ij"
+    )
+    directions = cp.stack(
+        (
+            radii_grid.ravel() * cp.cos(angles_grid.ravel()),
+            radii_grid.ravel() * cp.sin(angles_grid.ravel()),
+        ),
+        axis=1,
+    )
+    weight = 1.0 / float(radial_samples * azimuth_samples)
+    weights = cp.full(directions.shape[0], weight, dtype=config.accumulator_dtype)
+    return directions.astype(config.real_dtype), weights
+
+
+def convolve_with_solar_disk(
+    psf_grid: Any,
+    disk_kernel: Any,
+    config: ArrayGhostSimulationConfig,
+) -> tuple[Any, dict[str, Any]]:
+    """与太阳盘核做卷积。
+
+    沿用第二阶段的中心约定：不预先 ifftshift，full 卷积后从
+    kernel.shape // 2 开始裁切。
+    """
+    energy_before = float(psf_grid.sum(dtype=config.accumulator_dtype))
+    convolved = fftconvolve(psf_grid, disk_kernel, mode=config.convolution_mode)
+    start_y = disk_kernel.shape[0] // 2
+    start_x = disk_kernel.shape[1] // 2
+    convolved = convolved[
+        start_y : start_y + psf_grid.shape[0],
+        start_x : start_x + psf_grid.shape[1],
+    ]
+    energy_after = float(convolved.sum(dtype=config.accumulator_dtype))
+    if energy_after > 0.0:
+        convolved = convolved / energy_after
+    metadata = {
+        "energy_before": energy_before,
+        "energy_after": energy_after,
+        "energy_lost_fraction": (
+            abs(energy_before - energy_after) / energy_before
+            if energy_before > 0.0
+            else math.nan
+        ),
+    }
+    return convolved.astype(config.real_dtype), metadata
+
+
+def integrate_solar_source_direct(
+    grid: Any,
+    directions_arcmin: Any,
+    weights: Any,
+    pixel_arcmin: float,
+    config: ArrayGhostSimulationConfig,
+) -> Any:
+    """按方向逐项求和实现太阳盘积分，用于与卷积实现互相复算。
+
+    这条路径是平移不变的直接定义：
+        I(theta) = sum_s w_s * grid(theta - theta_s)
+    """
+    grid_size = int(grid.shape[0])
+    axis = (
+        cp.arange(grid_size, dtype=cp.float32) - grid_size // 2
+    )
+    grid_y, grid_x = cp.meshgrid(axis, axis, indexing="ij")
+    # 采样索引必须把'居中坐标'换算回'数组下标'，即加上中心偏移；
+    # 漏掉这一步会把核采到窗口外，总能量会凭空损失。
+    centre_index = grid_size // 2
+    accumulated = cp.zeros_like(grid, dtype=config.accumulator_dtype)
+    for index in range(int(directions_arcmin.shape[0])):
+        shift_x = float(directions_arcmin[index, 0]) / pixel_arcmin
+        shift_y = float(directions_arcmin[index, 1]) / pixel_arcmin
+        sampled = map_coordinates(
+            grid,
+            cp.stack(
+                (
+                    grid_y - shift_y + centre_index,
+                    grid_x - shift_x + centre_index,
+                ),
+                axis=0,
+            ),
+            order=config.psf_resampling_order,
+            mode="constant",
+            cval=0.0,
+        )
+        accumulated += float(weights[index]) * sampled
+    total = accumulated.sum(dtype=config.accumulator_dtype)
+    if float(total) > 0.0:
+        accumulated = accumulated / total
+    return accumulated.astype(config.real_dtype)
+
+
+def measure_image_width_arcmin(
+    grid: Any,
+    pixel_arcmin: float,
+    energy_fraction: float,
+    config: ArrayGhostSimulationConfig,
+) -> float:
+    """用径向包围能量（默认 50%）测量单孔像的等效宽度。"""
+    grid_size = int(grid.shape[0])
+    coordinate = (
+        cp.arange(grid_size, dtype=cp.float32) - grid_size // 2
+    )
+    grid_x, grid_y = cp.meshgrid(coordinate, coordinate, indexing="xy")
+    radius_px = cp.sqrt(grid_x * grid_x + grid_y * grid_y)
+    radial_bin_index = cp.floor(radius_px).astype(cp.int32)
+    radial_bin_count = int(radial_bin_index.max().item()) + 1
+    radial_energy = radial_bin_sum(
+        grid,
+        radial_bin_index,
+        radial_bin_count,
+        config.accumulator_dtype,
+    )
+    cumulative = cp.cumsum(radial_energy)
+    total = cumulative[-1]
+    target = total * energy_fraction
+    upper_index = int(cp.searchsorted(cumulative, target).item())
+    if upper_index <= 0:
+        radius_px_value = 0.0
+    else:
+        lower = cumulative[upper_index - 1]
+        upper = cumulative[upper_index]
+        if float(upper - lower) <= 0.0:
+            radius_px_value = float(upper_index)
+        else:
+            fraction = float((target - lower) / (upper - lower))
+            radius_px_value = upper_index - 1.0 + fraction
+    return 2.0 * radius_px_value * pixel_arcmin
+
+
+def plan_field_grid(
+    shifts_arcmin: Any,
+    image_width_arcmin: float,
+    config: ArrayGhostSimulationConfig,
+    kernel_half_width_arcmin: float | None = None,
+) -> dict[str, Any]:
+    """随视场大小和单孔像宽度自适应选择视场网格。
+
+    方案第 5 节要求宽视场总览与局部高分辨分开。这里让像素尺寸在
+    '解析单孔像宽度'与'装得下全部重影'之间取折中：先按单孔像宽度要求
+    细分，若网格超出上限再按上限粗化，并记录每个像宽占多少像素。
+
+    视场半宽必须同时容纳'最大孔心位移'和'单孔像核的半宽'。踩坑提示：
+    只按位移留边会把最外圈孔的核尾部裁掉，实测单孔能量会损失约 0.15%，
+    核半宽越大损失越明显。
+    """
+    if shifts_arcmin.size == 0:
+        max_shift_arcmin = 0.0
+    else:
+        max_shift_arcmin = float(
+            cp.sqrt((shifts_arcmin**2).sum(axis=1)).max()
+        )
+    if kernel_half_width_arcmin is None:
+        kernel_half_width_arcmin = config.solar_kernel_half_width_arcmin
+    half_width_arcmin = (
+        max_shift_arcmin * config.field_margin_factor
+        + kernel_half_width_arcmin
+        + config.field_extra_margin_arcmin
+    )
+    required_pixel_arcmin = (
+        image_width_arcmin / config.field_min_pixels_per_image_width
+        if image_width_arcmin > 0.0
+        else config.field_pixel_arcmin
+    )
+    pixel_arcmin = min(config.field_pixel_arcmin, required_pixel_arcmin)
+    grid_size = int(math.ceil(2.0 * half_width_arcmin / pixel_arcmin))
+    if grid_size % 2 != 0:
+        grid_size += 1
+    max_size = config.effective_field_grid_max_size()
+    coarsened = False
+    if grid_size > max_size:
+        grid_size = max_size
+        pixel_arcmin = 2.0 * half_width_arcmin / grid_size
+        coarsened = True
+    grid_size = max(grid_size, 16)
+    pixels_per_width = (
+        image_width_arcmin / pixel_arcmin if image_width_arcmin > 0.0 else math.nan
+    )
+    return {
+        "grid_size": grid_size,
+        "pixel_arcmin": pixel_arcmin,
+        "half_width_arcmin": half_width_arcmin,
+        "max_shift_arcmin": max_shift_arcmin,
+        "kernel_half_width_arcmin": kernel_half_width_arcmin,
+        "coarsened": coarsened,
+        "pixels_per_image_width": pixels_per_width,
+        "image_width_arcmin": image_width_arcmin,
+    }
+
+
+def circle_overlap_area_mm2(
+    centre_distance_mm: float,
+    radius_a_mm: float,
+    radius_b_mm: float,
+) -> float:
+    """两个圆的交叠面积（解析式），用于瞳孔通光权重。"""
+    if radius_a_mm <= 0.0 or radius_b_mm <= 0.0:
+        return 0.0
+    if centre_distance_mm >= radius_a_mm + radius_b_mm:
+        return 0.0
+    if centre_distance_mm <= abs(radius_a_mm - radius_b_mm):
+        return math.pi * min(radius_a_mm, radius_b_mm) ** 2
+    distance = centre_distance_mm
+    alpha = math.acos(
+        (distance * distance + radius_a_mm * radius_a_mm - radius_b_mm * radius_b_mm)
+        / (2.0 * distance * radius_a_mm)
+    )
+    beta = math.acos(
+        (distance * distance + radius_b_mm * radius_b_mm - radius_a_mm * radius_a_mm)
+        / (2.0 * distance * radius_b_mm)
+    )
+    return (
+        radius_a_mm * radius_a_mm * alpha
+        + radius_b_mm * radius_b_mm * beta
+        - 0.5
+        * math.sqrt(
+            max(
+                0.0,
+                (-distance + radius_a_mm + radius_b_mm)
+                * (distance + radius_a_mm - radius_b_mm)
+                * (distance - radius_a_mm + radius_b_mm)
+                * (distance + radius_a_mm + radius_b_mm),
+            )
+        )
+    )
+
+
+def compute_hole_weights(
+    layout: ArrayLayout,
+    pupil_diameter_mm: float | None,
+    config: ArrayGhostSimulationConfig,
+) -> tuple[np.ndarray, str]:
+    """每个孔的相对通光权重。
+
+    方案 5.4 节的权重来源。当前实现取'轴上视角的侧向瞳孔接受度'：
+    孔径为 d 的孔，其平行光束在瞳孔面上的落点半径约为 |x_i|，
+    通光比例等于孔圆与瞳孔圆的交叠面积除以孔面积。
+
+    限制：随视角变化的项（镜片到瞳孔距离乘以入射角）尚未计入，
+    因此结果标记为 quasi_static_pupil；未开启时权重为 1，
+    结果标记为 infinite_pupil_upper_bound（几何上限）。
+    """
+    hole_count = layout.hole_count
+    if not config.enable_pupil_vignetting or pupil_diameter_mm is None:
+        return np.ones(hole_count, dtype=np.float64), "infinite_pupil_upper_bound"
+
+    hole_radius_mm = 0.5 * layout.diameter_mm
+    pupil_radius_mm = 0.5 * pupil_diameter_mm
+    hole_area_mm2 = math.pi * hole_radius_mm * hole_radius_mm
+    offsets_mm = np.sqrt((layout.centers_mm**2).sum(axis=1))
+    weights = np.array(
+        [
+            circle_overlap_area_mm2(
+                float(offset_mm), hole_radius_mm, pupil_radius_mm
+            )
+            / hole_area_mm2
+            for offset_mm in offsets_mm
+        ],
+        dtype=np.float64,
+    )
+    return weights, "quasi_static_pupil"
+
+
+def accumulate_shifted_kernels(
+    kernel: Any,
+    kernel_pixel_arcmin: float,
+    shifts_arcmin: Any,
+    weights: Any,
+    field: dict[str, Any],
+    config: ArrayGhostSimulationConfig,
+) -> dict[str, Any]:
+    """把同一个单孔像核平移到每个孔位置并按强度累加。
+
+    这是方案 0.1 节的强度叠加：PSF_array = sum_i w_i * PSF_single(r - r_i/f)，
+    绝不出现复振幅求和。
+    """
+    field_size = int(field["grid_size"])
+    field_pixel_arcmin = float(field["pixel_arcmin"])
+    resampled_kernel = resample_psf_to_grid(
+        kernel,
+        kernel_pixel_arcmin,
+        field_size,
+        field_pixel_arcmin,
+        config,
+    )
+    axis = cp.arange(field_size, dtype=cp.float32) - field_size // 2
+    field_y, field_x = cp.meshgrid(axis, axis, indexing="ij")
+    # 居中坐标 -> 数组下标：加中心偏移。平移量为负号方向，保持与
+    # PSF_array(theta) = sum_i PSF_single(theta - r_i / f) 的定义一致。
+    centre_index = field_size // 2
+    accumulated = cp.zeros(
+        (field_size, field_size), dtype=config.accumulator_dtype
+    )
+    normalized_kernel = resampled_kernel / resampled_kernel.sum(
+        dtype=config.accumulator_dtype
+    )
+    for index in range(int(shifts_arcmin.shape[0])):
+        shift_x_px = float(shifts_arcmin[index, 0]) / field_pixel_arcmin
+        shift_y_px = float(shifts_arcmin[index, 1]) / field_pixel_arcmin
+        sampled = map_coordinates(
+            normalized_kernel,
+            cp.stack(
+                (
+                    field_y - shift_y_px + centre_index,
+                    field_x - shift_x_px + centre_index,
+                ),
+                axis=0,
+            ),
+            order=config.psf_resampling_order,
+            mode="constant",
+            cval=0.0,
+        )
+        accumulated += float(weights[index]) * sampled
+    total_energy = float(accumulated.sum(dtype=config.accumulator_dtype))
+    reference_weight = float(weights[0]) if weights.size else 1.0
+    peak = float(accumulated.max())
+    return {
+        "image": accumulated.astype(config.real_dtype),
+        "total_energy": total_energy,
+        "expected_energy": float(weights.sum(dtype=config.accumulator_dtype)),
+        "main_peak": peak,
+        "reference_weight": reference_weight,
+        "kernel_peak": float(normalized_kernel.max()),
+        "pixel_arcmin": field_pixel_arcmin,
+        "grid_size": field_size,
     }
 #
 # ============================================================================
