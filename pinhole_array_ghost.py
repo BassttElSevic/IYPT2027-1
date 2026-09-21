@@ -1,8 +1,10 @@
 # 第三阶段仿真：多针孔阵列重影与可分辨性
 # ============================================================================
-# 本文件当前只写实现方案、公式口径、验证门槛和踩坑提示，不写可执行代码。
-# 后续编码时，请把每一节按顺序落地；不要跳过验证，也不要把第三步的物理
-# 模型和第一步、第二步的模型重复实现。
+# 本文件分两部分：
+#   (A) 上方是第三阶段的实现方案、公式口径、验证门槛和踩坑提示；
+#   (B) 下方是实现部分，按方案第 14 节的函数顺序落地。
+# 编码时不要跳过验证，也不要把第三步的物理模型和第一步、第二步的模型
+# 重复实现。
 # 编码过程中的版本控制行为必须遵守第 17 节的 Git 提交与推送规范：
 # 写一点就 commit 并 push，提交信息必须多角度详细展开。
 #
@@ -897,6 +899,631 @@
 # - V-A 到 V-K 有 CSV 结果，所有 fail 项保留；
 # - 所有图、CSV、JSON 可由同一配置和固定 seed 复现；
 # - README 明确列出第三阶段的假设、缺失物理和不能外推的结论。
+
+
+# ============================================================================
+# 实现部分 1/5：配置、校验与输出基础设施
+# ============================================================================
+
+import csv
+import hashlib
+import json
+import math
+import time
+from dataclasses import asdict, dataclass, field, replace
+from pathlib import Path
+from typing import Any, Iterable, Sequence
+
+import cupy as cp
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+from cupyx.scipy.ndimage import map_coordinates
+from cupyx.scipy.signal import fftconvolve
+
+from single_hole_PSF import (
+    ARCMINUTES_PER_DEGREE,
+    ARCMINUTES_PER_RADIAN,
+    METRES_PER_MILLIMETRE,
+    METRES_PER_NANOMETRE,
+    SimulationConfig as PinholePSFSimulationConfig,
+    build_gpu_grids,
+    build_sampling,
+    build_soft_aperture,
+    compute_psf,
+    configure_bilingual_plot_font,
+    enclosing_diameter_arcmin,
+    radial_bin_sum,
+)
+
+
+# 五种主排布的名称契约。它们是字符串标识，不是可调物理量；
+# 阈值、尺寸和采样全部放在 ArrayGhostSimulationConfig 中。
+ARRAY_PATTERN_SQUARE_PACKING = "square_packing"
+ARRAY_PATTERN_TRIANGULAR_PACKING = "triangular_packing"
+ARRAY_PATTERN_HEXAGONAL_PACKING = "hexagonal_packing"
+ARRAY_PATTERN_HEXAGONAL_RINGS = "concentric_hexagonal_rings"
+ARRAY_PATTERN_CIRCULAR_RINGS = "concentric_circular_rings"
+ARRAY_PATTERN_KINDS: tuple[str, ...] = (
+    ARRAY_PATTERN_SQUARE_PACKING,
+    ARRAY_PATTERN_TRIANGULAR_PACKING,
+    ARRAY_PATTERN_HEXAGONAL_PACKING,
+    ARRAY_PATTERN_HEXAGONAL_RINGS,
+    ARRAY_PATTERN_CIRCULAR_RINGS,
+)
+
+# 随机对照的两种布局只作可选比较，不进入主排名。
+ARRAY_PATTERN_JITTERED_SQUARE = "jittered_square"
+ARRAY_PATTERN_POISSON_DISK = "poisson_disk"
+ARRAY_PATTERN_OPTIONAL_KINDS: tuple[str, ...] = (
+    ARRAY_PATTERN_JITTERED_SQUARE,
+    ARRAY_PATTERN_POISSON_DISK,
+)
+
+# 光源与风险标签的字符串契约。
+SOURCE_KIND_POINT = "point"
+SOURCE_KIND_SOLAR_DISK = "solar_disk"
+RISK_GHOST_RESOLVED = "GhostResolved"
+RISK_GHOST_MERGED = "GhostMerged"
+RISK_GHOST_WEAK = "GhostWeak"
+RISK_DEAD_ZONE = "DeadZoneRisk"
+RISK_PUPIL_VIGNETTED = "PupilVignetted"
+RISK_INVALID_GEOMETRY = "InvalidGeometry"
+
+
+@dataclass(frozen=True)
+class ArrayGhostSimulationConfig:
+    """第三阶段多针孔阵列重影仿真的全部输入、输出与绘图参数。
+
+    方案第 1 节要求：物理量、扫描量、排布量、光源量、网格大小、指标阈值、
+    绘图尺寸、字号、颜色和路径全部集中在这里，函数体内不得出现散落字面量。
+    """
+
+    # ---------------------------------------------------------------- 复用项
+    # 单孔 PSF 的物理与数值口径直接复用第一阶段配置，
+    # 不在这里重复定义波长采样、圆孔软边、离焦波前或 FFT 网格。
+    psf_config: PinholePSFSimulationConfig = field(
+        default_factory=PinholePSFSimulationConfig
+    )
+
+    # ------------------------------------------------------------ GPU 与精度
+    gpu_device_id: int = 0
+    real_dtype: Any = cp.float32
+    accumulator_dtype: Any = cp.float64
+    floating_comparison_tolerance: float = 1.0e-9
+
+    # ------------------------------------------------------------ 物理输入
+    focal_length_mm: float = 25.0
+    primary_wavelength_nm: float = 550.0
+    myopia_values_d: tuple[float, ...] = (0.5, 1.0, 2.0, 3.0, 4.0, 6.0)
+    representative_myopia_d: float = 3.0
+    pupil_diameter_values_mm: tuple[float, ...] = (2.0, 4.0, 8.0)
+    array_extent_radius_mm: float = 12.0
+    minimum_edge_clearance_mm: float = 0.2
+
+    # 瞳孔渐晕：没有镜片到瞳孔距离时，权重取 1 并标记为几何上限。
+    enable_pupil_vignetting: bool = False
+    pupil_plane_distance_mm: float | None = None
+
+    # --------------------------------------------------- 前两阶段结论复用
+    reuse_previous_metrics: bool = True
+    reuse_debug_label: str | None = None
+    retinal_metrics_relative_path: str = (
+        "output/single_hole_retinal_image/optotype_metrics.csv"
+    )
+    psf_metrics_relative_path_template: str = (
+        "output/single_hole_PSF/PSF_{wavelength_nm:g}nm/single_hole_metrics.csv"
+    )
+    retinal_threshold_column: str = "threshold_log_mar"
+    retinal_diameter_column: str = "diameter_mm"
+    retinal_myopia_column: str = "myopia_d"
+    retinal_wavelength_column: str = "wavelength_nm"
+    psf_metric_column: str = "log_mar"
+    psf_diameter_column: str = "diameter_mm"
+    psf_myopia_column: str = "myopia_d"
+    psf_wavelength_column: str = "wavelength_nm"
+    reference_anchor_wavelength_nm: float = 550.0
+    crosscheck_anchor_myopia_values_d: tuple[float, ...] = (1.0, 2.0, 3.0, 4.0, 6.0)
+    diameter_anchor_factors: tuple[float, ...] = (0.8, 0.9, 1.0, 1.1, 1.2)
+    coarse_diameter_check_factors: tuple[float, ...] = (0.5, 0.7, 1.5, 2.0)
+    diameter_deduplication_tolerance_mm: float = 1.0e-6
+    coarse_check_pitch_values_mm: tuple[float, ...] = (2.0, 4.0, 8.0)
+
+    # ------------------------------------------------------------ 排布参数
+    square_row_count: int = 9
+    square_column_count: int = 9
+    triangular_row_count: int = 9
+    triangular_column_count: int = 9
+    honeycomb_row_count: int = 7
+    honeycomb_column_count: int = 7
+    ring_count_values: tuple[int, ...] = (1, 2, 3, 4)
+    hexagonal_ring_radial_pitch_mm: float = 2.0
+    hexagonal_ring_rotation_step_deg: float = 30.0
+    circular_ring_holes_per_ring: tuple[int, ...] = (6, 12, 18, 24)
+    circular_ring_radial_pitch_mm: float = 2.0
+    circular_ring_rotation_step_deg: float = 15.0
+    pitch_reference_values_mm: tuple[float, ...] = (2.0, 2.5, 4.0, 8.0)
+    minimum_pitch_mm: float = 1.5
+    maximum_pitch_mm: float = 8.0
+    pitch_log_count: int = 9
+    pitch_to_diameter_ratio_values: tuple[float, ...] = (
+        2.0,
+        2.5,
+        3.0,
+        4.0,
+        5.0,
+        8.0,
+    )
+    diameter_to_pitch_ratio_values: tuple[float, ...] = (
+        0.15,
+        0.20,
+        0.25,
+        0.30,
+        0.40,
+    )
+    design_point_diameter_mm: tuple[float, ...] = (1.2, 1.0, 0.7)
+    design_point_pitch_mm: tuple[float, ...] = (2.0, 2.5, 2.0)
+    design_point_labels: tuple[str, ...] = ("A", "B", "C")
+    jitter_fraction: float = 0.05
+    poisson_disk_minimum_factor: float = 1.0
+    random_seed: int = 20260921
+    random_control_seed_count: int = 10
+
+    # ------------------------------------------------------------ 光源参数
+    source_kind: str = SOURCE_KIND_SOLAR_DISK
+    solar_angular_diameter_deg: float = 0.53
+    solar_radial_ring_count: int = 8
+    solar_azimuth_sample_count: int = 16
+    solar_radial_ring_dense_count: int = 16
+    solar_azimuth_dense_count: int = 32
+    solar_weight_sum_tolerance: float = 1.0e-6
+    spectral_wavelengths_nm: tuple[float, ...] = (
+        400.0,
+        450.0,
+        500.0,
+        550.0,
+        600.0,
+        650.0,
+        700.0,
+    )
+
+    # ------------------------------------------------------- 网格与重采样
+    analysis_grid_size: int = 1024
+    analysis_pixel_arcmin: float = 0.25
+    solar_kernel_half_width_arcmin: float = 64.0
+    field_pixel_arcmin: float = 0.25
+    field_grid_max_size: int = 2048
+    field_margin_factor: float = 1.05
+    field_extra_margin_arcmin: float = 32.0
+    psf_resampling_order: int = 1
+    convolution_mode: str = "full"
+    aperture_anti_alias_subsamples: int = 4
+
+    # ------------------------------------------------------------ 重影指标
+    visibility_peak_threshold: float = 1.0e-3
+    merge_radius_factor: float = 0.5
+    separation_ratio_threshold: float = 2.0
+    ghost_peak_ratio_threshold: float = 0.05
+    valley_numeric_max_separation_arcmin: float = 240.0
+    valley_profile_sample_count: int = 512
+    sun_width_energy_fraction: float = 0.50
+    direction_histogram_bin_count: int = 36
+    main_window_radius_factor: float = 1.0
+    core_neighbor_radius_factor: float = 1.05
+
+    # -------------------------------------------------------- 验证判据
+    mask_area_relative_tolerance: float = 0.01
+    mask_centroid_tolerance_pixel: float = 0.75
+    shift_angle_tolerance_percent: float = 2.0
+    first_order_angle_tolerance_percent: float = 5.0
+    energy_relative_tolerance_percent: float = 0.1
+    solar_convergence_tolerance_percent: float = 2.0
+    grid_convergence_tolerance_percent: float = 2.0
+    grid_convergence_dense_factor: int = 2
+    coarse_check_degradation_tolerance_percent: float = 5.0
+
+    # ------------------------------------------------------------ 绘图参数
+    figure_dpi: int = 300
+    pattern_figure_size_inches: tuple[float, float] = (28.0, 20.0)
+    mask_figure_size_inches: tuple[float, float] = (28.0, 20.0)
+    point_source_figure_size_inches: tuple[float, float] = (30.0, 22.0)
+    solar_comparison_figure_size_inches: tuple[float, float] = (30.0, 23.0)
+    ring_comparison_figure_size_inches: tuple[float, float] = (30.0, 22.0)
+    ghost_heatmap_figure_size_inches: tuple[float, float] = (30.0, 20.0)
+    diameter_pitch_figure_size_inches: tuple[float, float] = (30.0, 22.0)
+    slice_figure_size_inches: tuple[float, float] = (28.0, 18.0)
+    design_figure_size_inches: tuple[float, float] = (28.0, 18.0)
+    validation_figure_size_inches: tuple[float, float] = (24.0, 14.0)
+    suptitle_font_size: float = 17.0
+    axis_title_font_size: float = 12.0
+    axis_label_font_size: float = 11.0
+    legend_font_size: float = 8.0
+    panel_title_font_size: float = 9.0
+    tick_font_size: float = 8.0
+    conclusion_font_size: float = 11.0
+    table_font_size: float = 9.0
+    image_log_dynamic_range: float = 3.0
+    image_colormap_name: str = "inferno"
+    pattern_colormap_name: str = "viridis"
+    heatmap_colormap_name: str = "magma"
+    ghost_heatmap_vmin: float = 0.0
+    ghost_heatmap_vmax: float = 4.0
+    pattern_marker_size: float = 12.0
+    pattern_schematic_pitch_mm: float = 2.0
+    pattern_schematic_diameter_mm: float = 0.7
+    pattern_schematic_ring_count: int = 3
+    pattern_schematic_half_extent_mm: float = 9.0
+
+    # ------------------------------------------------------- 输出与命名
+    output_root_directory_name: str = "output"
+    simulation_directory_name: str = "pinhole_array_ghost"
+    config_filename: str = "array_ghost_config.json"
+    previous_anchor_filename: str = "previous_diameter_anchors.csv"
+    refined_grid_filename: str = "refined_diameter_pitch_grid.csv"
+    coarse_grid_filename: str = "coarse_diameter_pitch_grid.csv"
+    geometry_filename: str = "array_geometry.csv"
+    ghost_metrics_filename: str = "ghost_metrics.csv"
+    ring_geometry_filename: str = "ring_geometry.csv"
+    ghost_peak_filename: str = "ghost_peak_rows.csv"
+    solar_convergence_filename: str = "solar_convergence.csv"
+    validation_filename: str = "validation_anchors.csv"
+    pareto_filename: str = "pareto_front_diameter_pitch.csv"
+    pattern_figure_filename: str = "array_patterns.png"
+    mask_figure_filename: str = "array_masks.png"
+    point_source_figure_filename: str = "point_source_array_psf.png"
+    solar_comparison_figure_filename: str = "solar_ghost_comparison.png"
+    ring_comparison_figure_filename: str = "ring_count_comparison.png"
+    ghost_heatmap_figure_filename: str = "ghost_angle_heatmap.png"
+    diameter_pitch_figure_filename: str = "ghost_diameter_pitch_relation.png"
+    slice_figure_filename: str = "pitch_diameter_slices.png"
+    design_figure_filename: str = "design_comparison.png"
+    validation_figure_filename: str = "validation_table.png"
+
+    # ------------------------------------------------------- 运行模式
+    run_mode: str = "full"
+    quick_row_count: int = 5
+    quick_column_count: int = 5
+    quick_ring_count_values: tuple[int, ...] = (1, 2)
+    quick_analysis_grid_size: int = 512
+    quick_field_grid_max_size: int = 768
+    quick_pitch_values_mm: tuple[float, ...] = (2.0, 4.0)
+    quick_myopia_values_d: tuple[float, ...] = (3.0,)
+    quick_diameter_factors: tuple[float, ...] = (1.0,)
+    quick_solar_radial_ring_count: int = 4
+    quick_solar_azimuth_sample_count: int = 8
+
+    # ------------------------------------------------------------ 派生量
+    @property
+    def solar_angular_radius_deg(self) -> float:
+        return 0.5 * self.solar_angular_diameter_deg
+
+    @property
+    def solar_angular_radius_arcmin(self) -> float:
+        return self.solar_angular_radius_deg * ARCMINUTES_PER_DEGREE
+
+    @property
+    def valid_pattern_kinds(self) -> tuple[str, ...]:
+        return ARRAY_PATTERN_KINDS + ARRAY_PATTERN_OPTIONAL_KINDS
+
+    @property
+    def quick_mode(self) -> bool:
+        return self.run_mode == "quick"
+
+    def effective_row_count(self) -> int:
+        return self.quick_row_count if self.quick_mode else self.square_row_count
+
+    def effective_column_count(self) -> int:
+        return (
+            self.quick_column_count if self.quick_mode else self.square_column_count
+        )
+
+    def effective_analysis_grid_size(self) -> int:
+        return (
+            self.quick_analysis_grid_size
+            if self.quick_mode
+            else self.analysis_grid_size
+        )
+
+    def effective_field_grid_max_size(self) -> int:
+        return (
+            self.quick_field_grid_max_size
+            if self.quick_mode
+            else self.field_grid_max_size
+        )
+
+    def effective_ring_count_values(self) -> tuple[int, ...]:
+        return (
+            self.quick_ring_count_values if self.quick_mode else self.ring_count_values
+        )
+
+    def effective_pitch_values_mm(self) -> tuple[float, ...]:
+        return self.quick_pitch_values_mm if self.quick_mode else self.pitch_reference_values_mm
+
+    def effective_myopia_values_d(self) -> tuple[float, ...]:
+        return self.quick_myopia_values_d if self.quick_mode else self.myopia_values_d
+
+    def effective_diameter_anchor_factors(self) -> tuple[float, ...]:
+        return (
+            self.quick_diameter_factors
+            if self.quick_mode
+            else self.diameter_anchor_factors
+        )
+
+    def effective_solar_radial_ring_count(self) -> int:
+        return (
+            self.quick_solar_radial_ring_count
+            if self.quick_mode
+            else self.solar_radial_ring_count
+        )
+
+    def effective_solar_azimuth_sample_count(self) -> int:
+        return (
+            self.quick_solar_azimuth_sample_count
+            if self.quick_mode
+            else self.solar_azimuth_sample_count
+        )
+
+    # ------------------------------------------------------------ 自校验
+    def validate(self) -> None:
+        validate_config(self)
+
+    def quick_variant(self) -> "ArrayGhostSimulationConfig":
+        return replace(self, run_mode="quick")
+
+
+def validate_output_component(value: str, field_name: str) -> str:
+    """输出目录名与文件名必须是单个安全路径分量。"""
+    if not value:
+        raise ValueError(f"{field_name} must not be empty")
+    if value != Path(value).name:
+        raise ValueError(f"{field_name} must be a single path component: {value!r}")
+    if value in {".", ".."}:
+        raise ValueError(f"{field_name} must not be a relative path token: {value!r}")
+    return value
+
+
+def validate_config(config: ArrayGhostSimulationConfig) -> None:
+    """方案 1.5 节：在任何 GPU 分配之前拒绝非法配置。"""
+    if config.real_dtype not in (cp.float32, cp.float64):
+        raise ValueError("real_dtype must be cp.float32 or cp.float64")
+    if config.accumulator_dtype not in (cp.float32, cp.float64):
+        raise ValueError("accumulator_dtype must be cp.float32 or cp.float64")
+    if config.gpu_device_id < 0:
+        raise ValueError("gpu_device_id must be non-negative")
+
+    positive_scalars = {
+        "focal_length_mm": config.focal_length_mm,
+        "primary_wavelength_nm": config.primary_wavelength_nm,
+        "representative_myopia_d": config.representative_myopia_d,
+        "array_extent_radius_mm": config.array_extent_radius_mm,
+        "analysis_pixel_arcmin": config.analysis_pixel_arcmin,
+        "field_pixel_arcmin": config.field_pixel_arcmin,
+        "solar_kernel_half_width_arcmin": config.solar_kernel_half_width_arcmin,
+        "solar_angular_diameter_deg": config.solar_angular_diameter_deg,
+        "hexagonal_ring_radial_pitch_mm": config.hexagonal_ring_radial_pitch_mm,
+        "circular_ring_radial_pitch_mm": config.circular_ring_radial_pitch_mm,
+        "minimum_pitch_mm": config.minimum_pitch_mm,
+        "maximum_pitch_mm": config.maximum_pitch_mm,
+        "merge_radius_factor": config.merge_radius_factor,
+        "separation_ratio_threshold": config.separation_ratio_threshold,
+        "sun_width_energy_fraction": config.sun_width_energy_fraction,
+        "figure_dpi": float(config.figure_dpi),
+    }
+    for name, value in positive_scalars.items():
+        if not math.isfinite(value) or value <= 0.0:
+            raise ValueError(f"{name} must be finite and positive, got {value!r}")
+
+    if config.minimum_edge_clearance_mm < 0.0:
+        raise ValueError("minimum_edge_clearance_mm must be non-negative")
+    if config.maximum_pitch_mm <= config.minimum_pitch_mm:
+        raise ValueError("maximum_pitch_mm must exceed minimum_pitch_mm")
+    if not 0.0 < config.sun_width_energy_fraction < 1.0:
+        raise ValueError("sun_width_energy_fraction must lie in (0, 1)")
+    if config.field_margin_factor < 1.0:
+        raise ValueError("field_margin_factor must be at least 1")
+    if config.field_extra_margin_arcmin < config.solar_angular_radius_arcmin:
+        raise ValueError(
+            "field_extra_margin_arcmin must cover at least the solar radius"
+        )
+    if config.visibility_peak_threshold <= 0.0:
+        raise ValueError("visibility_peak_threshold must be positive")
+    if config.quick_mode and config.reuse_previous_metrics is False:
+        # quick 模式也必须在正式结论中复用前两阶段锚点。
+        raise ValueError("quick mode still requires reuse_previous_metrics")
+    if not config.reuse_previous_metrics:
+        if not config.reuse_debug_label:
+            raise ValueError(
+                "reuse_previous_metrics=False requires a debug label; "
+                "formal conclusions may not be produced this way"
+            )
+
+    if config.source_kind not in (SOURCE_KIND_POINT, SOURCE_KIND_SOLAR_DISK):
+        raise ValueError(f"unsupported source_kind: {config.source_kind!r}")
+
+    integer_fields = {
+        "analysis_grid_size": config.analysis_grid_size,
+        "field_grid_max_size": config.field_grid_max_size,
+        "square_row_count": config.square_row_count,
+        "square_column_count": config.square_column_count,
+        "triangular_row_count": config.triangular_row_count,
+        "triangular_column_count": config.triangular_column_count,
+        "honeycomb_row_count": config.honeycomb_row_count,
+        "honeycomb_column_count": config.honeycomb_column_count,
+        "solar_radial_ring_count": config.solar_radial_ring_count,
+        "solar_azimuth_sample_count": config.solar_azimuth_sample_count,
+        "solar_radial_ring_dense_count": config.solar_radial_ring_dense_count,
+        "solar_azimuth_dense_count": config.solar_azimuth_dense_count,
+        "direction_histogram_bin_count": config.direction_histogram_bin_count,
+        "valley_profile_sample_count": config.valley_profile_sample_count,
+        "aperture_anti_alias_subsamples": config.aperture_anti_alias_subsamples,
+    }
+    for name, value in integer_fields.items():
+        if int(value) < 1:
+            raise ValueError(f"{name} must be a positive integer")
+    if config.analysis_grid_size % 2 != 0:
+        raise ValueError("analysis_grid_size must be even")
+    if config.field_grid_max_size % 2 != 0:
+        raise ValueError("field_grid_max_size must be even")
+    if config.direction_histogram_bin_count < 4:
+        raise ValueError("direction_histogram_bin_count must be at least 4")
+    if config.solar_radial_ring_dense_count < config.solar_radial_ring_count:
+        raise ValueError(
+            "solar_radial_ring_dense_count must be at least solar_radial_ring_count"
+        )
+    if config.solar_azimuth_dense_count < config.solar_azimuth_sample_count:
+        raise ValueError(
+            "solar_azimuth_dense_count must be at least solar_azimuth_sample_count"
+        )
+    if config.grid_convergence_dense_factor < 2:
+        raise ValueError("grid_convergence_dense_factor must be at least 2")
+
+    non_empty_tuples = {
+        "myopia_values_d": config.myopia_values_d,
+        "pupil_diameter_values_mm": config.pupil_diameter_values_mm,
+        "ring_count_values": config.ring_count_values,
+        "circular_ring_holes_per_ring": config.circular_ring_holes_per_ring,
+        "pitch_to_diameter_ratio_values": config.pitch_to_diameter_ratio_values,
+        "diameter_to_pitch_ratio_values": config.diameter_to_pitch_ratio_values,
+        "diameter_anchor_factors": config.diameter_anchor_factors,
+        "coarse_diameter_check_factors": config.coarse_diameter_check_factors,
+        "spectral_wavelengths_nm": config.spectral_wavelengths_nm,
+        "design_point_diameter_mm": config.design_point_diameter_mm,
+        "design_point_pitch_mm": config.design_point_pitch_mm,
+        "design_point_labels": config.design_point_labels,
+    }
+    for name, values in non_empty_tuples.items():
+        if not values:
+            raise ValueError(f"{name} must not be empty")
+    if any(value <= 0.0 for value in config.myopia_values_d):
+        raise ValueError("myopia_values_d must be positive (0 D has no finite d*)")
+    for value in config.diameter_anchor_factors:
+        if value <= 0.0:
+            raise ValueError("diameter_anchor_factors must be positive")
+    for value in config.ring_count_values:
+        if value < 1:
+            raise ValueError("ring_count_values must be at least 1")
+    for value in config.circular_ring_holes_per_ring:
+        if value < 3:
+            raise ValueError("each circular ring needs at least 3 holes")
+    for value in config.pitch_to_diameter_ratio_values:
+        if value <= 1.0:
+            raise ValueError("pitch_to_diameter_ratio_values must exceed 1")
+    for value in config.diameter_to_pitch_ratio_values:
+        if not 0.0 < value < 1.0:
+            raise ValueError("diameter_to_pitch_ratio_values must lie in (0, 1)")
+    if len(config.design_point_diameter_mm) != len(config.design_point_pitch_mm):
+        raise ValueError("design point diameters and pitches must have equal length")
+    if len(config.design_point_labels) != len(config.design_point_diameter_mm):
+        raise ValueError("design point labels must match design point count")
+    for diameter_mm, pitch_mm in zip(
+        config.design_point_diameter_mm, config.design_point_pitch_mm
+    ):
+        if pitch_mm - diameter_mm < config.minimum_edge_clearance_mm:
+            raise ValueError(
+                "design point violates minimum_edge_clearance_mm: "
+                f"d={diameter_mm}, p={pitch_mm}"
+            )
+
+    # 排布规模必须足以体现周期规律（至少 3x3 内部孔）。
+    for name, count in {
+        "square_row_count": config.square_row_count,
+        "square_column_count": config.square_column_count,
+        "triangular_row_count": config.triangular_row_count,
+        "triangular_column_count": config.triangular_column_count,
+        "honeycomb_row_count": config.honeycomb_row_count,
+        "honeycomb_column_count": config.honeycomb_column_count,
+    }.items():
+        if count < 3:
+            raise ValueError(f"{name} must be at least 3")
+
+    if config.enable_pupil_vignetting:
+        if config.pupil_plane_distance_mm is None:
+            raise ValueError(
+                "enable_pupil_vignetting requires pupil_plane_distance_mm; "
+                "without it the off-axis geometry is undefined"
+            )
+        if config.pupil_plane_distance_mm < 0.0:
+            raise ValueError("pupil_plane_distance_mm must be non-negative")
+
+    if config.psf_config.grid_size != config.psf_config.grid_size // 2 * 2:
+        raise ValueError("psf_config.grid_size must be even")
+    if config.psf_config.aperture_diameter_pixels <= 0.0:
+        raise ValueError("psf_config.aperture_diameter_pixels must be positive")
+
+    for field_name in (
+        "output_root_directory_name",
+        "simulation_directory_name",
+        "config_filename",
+        "previous_anchor_filename",
+        "refined_grid_filename",
+        "coarse_grid_filename",
+        "geometry_filename",
+        "ghost_metrics_filename",
+        "ring_geometry_filename",
+        "ghost_peak_filename",
+        "solar_convergence_filename",
+        "validation_filename",
+        "pareto_filename",
+        "pattern_figure_filename",
+        "mask_figure_filename",
+        "point_source_figure_filename",
+        "solar_comparison_figure_filename",
+        "ring_comparison_figure_filename",
+        "ghost_heatmap_figure_filename",
+        "diameter_pitch_figure_filename",
+        "slice_figure_filename",
+        "design_figure_filename",
+        "validation_figure_filename",
+    ):
+        validate_output_component(getattr(config, field_name), field_name)
+
+
+def resolve_simulation_directory(config: ArrayGhostSimulationConfig) -> Path:
+    """输出根目录固定在仓库下的 output，不使用外部绝对盘符。"""
+    repository_root = Path(__file__).resolve().parent
+    directory = (
+        repository_root
+        / config.output_root_directory_name
+        / config.simulation_directory_name
+    )
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        for block in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def write_csv(
+    path: Path,
+    rows: Sequence[dict[str, Any]],
+    fieldnames: Sequence[str],
+) -> None:
+    with path.open("w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=list(fieldnames))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def print_progress(
+    completed: int,
+    total: int,
+    started_at: float,
+    label: str,
+) -> None:
+    elapsed = time.perf_counter() - started_at
+    fraction = completed / total if total else 0.0
+    print(
+        f"[{label}] {completed}/{total} ({fraction:6.2%}) "
+        f"elapsed {elapsed:7.1f}s",
+        flush=True,
+    )
 #
 # ============================================================================
 # 17. Git 提交与推送规范：小步提交，多角度详细提交信息
