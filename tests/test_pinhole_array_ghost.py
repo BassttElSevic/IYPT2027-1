@@ -24,10 +24,13 @@ from pinhole_array_ghost import (
     generate_jittered_square,
     generate_square_packing,
     generate_triangular_packing,
+    lattice_unit_cell_area_mm2,
     minimum_ring_radius_mm,
+    rasterize_mask,
     resolve_simulation_directory,
     validate_config,
     validate_layout,
+    validate_mask,
     validate_output_component,
 )
 
@@ -226,6 +229,28 @@ def neighbor_angles_deg(centers: Any, center_index: int, radius_mm: float) -> li
     mask = (distances > 0.0) & (distances <= radius_mm)
     angles = np.degrees(np.arctan2(offsets[mask, 1], offsets[mask, 0]))
     return sorted(float(angle) % 360.0 for angle in angles)
+
+
+def single_hole_layout(diameter_mm: float):
+    """构造只有一个中心孔的排布，用于覆盖度基本性质测试。"""
+    import numpy as np
+
+    from pinhole_array_ghost import ArrayLayout
+
+    return ArrayLayout(
+        pattern_kind="square_packing",
+        centers_mm=np.zeros((1, 2), dtype=np.float64),
+        pitch_nominal_mm=2.0,
+        diameter_mm=diameter_mm,
+        row_count=1,
+        column_count=1,
+        ring_count=0,
+        holes_per_ring=(),
+        ring_radii_mm=(),
+        ring_radial_pitch_mm=2.0,
+        analytic_area_fraction=math.nan,
+        notes="single hole coverage probe",
+    )
 
 
 class SquarePackingTest(unittest.TestCase):
@@ -546,6 +571,141 @@ class LayoutQualityTest(unittest.TestCase):
         self.assertTrue((first.centers_mm == second.centers_mm).all())
         self.assertFalse((first.centers_mm == third.centers_mm).all())
         self.assertEqual(first.hole_count, second.hole_count)
+
+
+class MaskCoverageTest(unittest.TestCase):
+    """方案 3.3 节要求的覆盖度基本性质：圆心为 1、远处为 0、边缘半透明。"""
+
+    def test_single_hole_coverage_centre_is_one_and_far_field_is_zero(self) -> None:
+        config = ArrayGhostSimulationConfig()
+        layout = single_hole_layout(diameter_mm=0.7)
+        mask = rasterize_mask(layout, config)
+        centre = mask.coverage.shape[0] // 2
+
+        # 圆心附近应完全覆盖，远离圆孔处应完全没有覆盖。
+        self.assertAlmostEqual(float(mask.coverage[centre, centre]), 1.0, places=9)
+        self.assertAlmostEqual(float(mask.coverage[0, 0]), 0.0, places=9)
+        self.assertAlmostEqual(float(mask.coverage[-1, -1]), 0.0, places=9)
+
+    def test_single_hole_edge_has_partial_coverage(self) -> None:
+        config = ArrayGhostSimulationConfig()
+        layout = single_hole_layout(diameter_mm=0.7)
+        mask = rasterize_mask(layout, config)
+
+        values = mask.coverage.ravel()
+        partial = values[(values > 0.0) & (values < 1.0)]
+        self.assertGreater(partial.size, 0)
+        self.assertLess(float(partial.min()), 1.0)
+
+    def test_coverage_never_exceeds_one(self) -> None:
+        config = ArrayGhostSimulationConfig()
+        layout = generate_square_packing(config, pitch_mm=2.0, diameter_mm=1.2)
+        mask = rasterize_mask(layout, config)
+
+        self.assertLessEqual(float(mask.coverage.max()), 1.0)
+        self.assertGreaterEqual(float(mask.coverage.min()), 0.0)
+
+    def test_numeric_area_matches_analytic_circle_area(self) -> None:
+        config = ArrayGhostSimulationConfig()
+        layout = generate_square_packing(config, pitch_mm=2.0, diameter_mm=0.7)
+        mask = rasterize_mask(layout, config)
+        qc = validate_mask(mask, layout, config)
+
+        self.assertLess(
+            qc["relative_area_error"],
+            config.mask_area_relative_tolerance,
+        )
+        self.assertTrue(qc["mask_ok"], qc["fail_reasons"])
+
+    def test_all_patterns_have_matching_component_counts(self) -> None:
+        config = ArrayGhostSimulationConfig()
+        layouts = (
+            generate_square_packing(config, 2.0, 0.7),
+            generate_triangular_packing(config, 2.0, 0.7),
+            generate_hexagonal_packing(config, 2.0, 0.7),
+            generate_hexagonal_rings(config, 2.0, 0.7, 2),
+            generate_circular_rings(config, 2.0, 0.7),
+        )
+        for layout in layouts:
+            with self.subTest(pattern=layout.pattern_kind):
+                mask = rasterize_mask(layout, config)
+                qc = validate_mask(mask, layout, config)
+                self.assertEqual(qc["labeled_hole_count"], qc["designed_hole_count"])
+                self.assertLess(
+                    qc["relative_area_error"],
+                    config.mask_area_relative_tolerance,
+                )
+                self.assertTrue(qc["mask_ok"], qc["fail_reasons"])
+
+    def test_mask_detects_overlapping_holes(self) -> None:
+        config = ArrayGhostSimulationConfig()
+        layout = generate_square_packing(config, pitch_mm=0.6, diameter_mm=0.7)
+        mask = rasterize_mask(layout, config)
+        qc = validate_mask(mask, layout, config)
+
+        self.assertLess(qc["labeled_hole_count"], qc["designed_hole_count"])
+        self.assertFalse(qc["mask_ok"])
+        self.assertIn("connected_component_count_mismatch", qc["fail_reasons"])
+
+    def test_centroid_offset_within_tolerance(self) -> None:
+        config = ArrayGhostSimulationConfig()
+        layout = generate_triangular_packing(config, 2.0, 0.7)
+        mask = rasterize_mask(layout, config)
+        qc = validate_mask(mask, layout, config)
+
+        self.assertLessEqual(
+            qc["max_centroid_offset_mm"],
+            qc["centroid_tolerance_mm"],
+        )
+
+    def test_mask_resolution_guard_rejects_coarse_grid(self) -> None:
+        config = replace(ArrayGhostSimulationConfig(), mask_pixel_mm=0.2)
+        layout = generate_square_packing(config, pitch_mm=2.0, diameter_mm=0.7)
+
+        # 0.7 mm 直径在 0.2 mm 像素上只有约 3.5 个像素，必须被拒绝。
+        with self.assertRaises(ValueError):
+            rasterize_mask(layout, config)
+
+
+class LatticeFillingTest(unittest.TestCase):
+    def test_triangular_denser_than_square_denser_than_honeycomb(self) -> None:
+        pitch_mm, diameter_mm = 2.0, 0.7
+        hole_area_mm2 = math.pi * (0.5 * diameter_mm) ** 2
+        fillings = {
+            pattern: hole_area_mm2
+            / lattice_unit_cell_area_mm2(pattern, pitch_mm)
+            for pattern in (
+                "square_packing",
+                "triangular_packing",
+                "hexagonal_packing",
+            )
+        }
+
+        self.assertGreater(
+            fillings["triangular_packing"], fillings["square_packing"]
+        )
+        self.assertGreater(
+            fillings["square_packing"], fillings["hexagonal_packing"]
+        )
+
+    def test_honeycomb_unit_cell_holds_two_holes(self) -> None:
+        pitch_mm = 2.0
+        cell_area_mm2 = lattice_unit_cell_area_mm2(
+            "hexagonal_packing", pitch_mm
+        )
+        self.assertAlmostEqual(
+            cell_area_mm2,
+            0.75 * math.sqrt(3.0) * pitch_mm * pitch_mm,
+            places=12,
+        )
+
+    def test_ring_layouts_have_no_unit_cell(self) -> None:
+        self.assertTrue(
+            math.isnan(
+                lattice_unit_cell_area_mm2("concentric_hexagonal_rings", 2.0)
+            )
+        )
+
 
 
 if __name__ == "__main__":

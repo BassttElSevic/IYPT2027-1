@@ -1102,6 +1102,11 @@ class ArrayGhostSimulationConfig:
     psf_resampling_order: int = 1
     convolution_mode: str = "full"
     aperture_anti_alias_subsamples: int = 4
+    mask_pixel_mm: float = 0.02
+    mask_margin_mm: float = 0.5
+    mask_binary_threshold: float = 0.5
+    mask_minimum_pixels_per_diameter: float = 12.0
+    mask_minimum_circularity: float = 0.85
 
     # ------------------------------------------------------------ 重影指标
     visibility_peak_threshold: float = 1.0e-3
@@ -1453,6 +1458,19 @@ def validate_config(config: ArrayGhostSimulationConfig) -> None:
         raise ValueError("psf_config.grid_size must be even")
     if config.psf_config.aperture_diameter_pixels <= 0.0:
         raise ValueError("psf_config.aperture_diameter_pixels must be positive")
+    if config.mask_pixel_mm <= 0.0:
+        raise ValueError("mask_pixel_mm must be positive")
+    if config.mask_margin_mm < 0.0:
+        raise ValueError("mask_margin_mm must be non-negative")
+    if not 0.0 < config.mask_binary_threshold < 1.0:
+        raise ValueError("mask_binary_threshold must lie in (0, 1)")
+    if config.mask_minimum_pixels_per_diameter < 4.0:
+        raise ValueError(
+            "mask_minimum_pixels_per_diameter must be at least 4 so that "
+            "the circle edge stays resolvable"
+        )
+    if not 0.0 < config.mask_minimum_circularity <= 1.0:
+        raise ValueError("mask_minimum_circularity must lie in (0, 1]")
 
     for field_name in (
         "output_root_directory_name",
@@ -2002,6 +2020,262 @@ def validate_layout(
         "geometry_ok": geometry_ok,
         "topology_ok": topology_ok,
         "notes": layout.notes,
+    }
+
+
+# ============================================================================
+# 实现部分 3/5：抗锯齿掩膜与掩膜质检
+# ============================================================================
+#
+# 掩膜只服务几何、透过率与图形质量，不作为整块镜片的波动传播输入。
+# 第二步曾出现'矩形覆盖度内部不是 1、外部不是 0'的错误，因此这里的圆孔
+# 覆盖度必须测试圆心为 1、远处为 0、边缘落在 0 到 1 之间。
+
+
+@dataclass(frozen=True)
+class MaskGeometry:
+    """掩膜数组与它的物理坐标窗口。"""
+
+    coverage: np.ndarray
+    pixel_mm: float
+    x_min_mm: float
+    x_max_mm: float
+    y_min_mm: float
+    y_max_mm: float
+
+    @property
+    def pixel_count(self) -> int:
+        return int(self.coverage.size)
+
+    @property
+    def window_area_mm2(self) -> float:
+        return (self.x_max_mm - self.x_min_mm) * (self.y_max_mm - self.y_min_mm)
+
+    def axes_mm(self) -> tuple[np.ndarray, np.ndarray]:
+        x_axis = np.linspace(
+            self.x_min_mm + 0.5 * self.pixel_mm,
+            self.x_max_mm - 0.5 * self.pixel_mm,
+            self.coverage.shape[1],
+        )
+        y_axis = np.linspace(
+            self.y_min_mm + 0.5 * self.pixel_mm,
+            self.y_max_mm - 0.5 * self.pixel_mm,
+            self.coverage.shape[0],
+        )
+        return x_axis, y_axis
+
+
+def _mask_grid_parameters(
+    layout: ArrayLayout,
+    config: ArrayGhostSimulationConfig,
+) -> tuple[int, float, float]:
+    """由孔心范围与孔半径决定掩膜窗口半宽、像素数与像素尺寸。"""
+    max_radius_mm = float(np.sqrt((layout.centers_mm**2).sum(axis=1)).max())
+    half_extent_mm = max_radius_mm + 0.5 * layout.diameter_mm + config.mask_margin_mm
+    pixel_count = int(math.ceil(2.0 * half_extent_mm / config.mask_pixel_mm))
+    if pixel_count % 2 != 0:
+        pixel_count += 1
+    pixel_count = max(pixel_count, 8)
+    pixel_mm = 2.0 * half_extent_mm / pixel_count
+    return pixel_count, pixel_mm, half_extent_mm
+
+
+def rasterize_mask(
+    layout: ArrayLayout,
+    config: ArrayGhostSimulationConfig,
+) -> MaskGeometry:
+    """在 4x4 子网格上画圆孔再块平均，得到 [0, 1] 覆盖度。
+
+    每个孔只在自己的包围盒内计算，避免 O(像素数 x 孔数) 的全图距离运算。
+    """
+    pixel_count, pixel_mm, half_extent_mm = _mask_grid_parameters(layout, config)
+    pixels_per_diameter = layout.diameter_mm / pixel_mm
+    if pixels_per_diameter < config.mask_minimum_pixels_per_diameter:
+        raise ValueError(
+            "mask resolution too coarse: "
+            f"diameter {layout.diameter_mm} mm spans only "
+            f"{pixels_per_diameter:.2f} pixels"
+        )
+
+    coverage = np.zeros((pixel_count, pixel_count), dtype=np.float64)
+    subsample_count = config.aperture_anti_alias_subsamples
+    if subsample_count < 1:
+        raise ValueError("aperture_anti_alias_subsamples must be positive")
+
+    # 子采样点位于像素内的等距格点中心。
+    subsample_offsets = (
+        np.arange(subsample_count, dtype=np.float64) + 0.5
+    ) / subsample_count - 0.5
+    radius_mm = 0.5 * layout.diameter_mm
+    axis_origin_mm = -half_extent_mm
+    pixel_area_subweight = 1.0 / float(subsample_count * subsample_count)
+
+    for center_x_mm, center_y_mm in layout.centers_mm:
+        x_low_mm = center_x_mm - radius_mm - config.mask_margin_mm
+        x_high_mm = center_x_mm + radius_mm + config.mask_margin_mm
+        y_low_mm = center_y_mm - radius_mm - config.mask_margin_mm
+        y_high_mm = center_y_mm + radius_mm + config.mask_margin_mm
+
+        x_start = max(0, int(math.floor((x_low_mm - axis_origin_mm) / pixel_mm)))
+        x_stop = min(
+            pixel_count,
+            int(math.ceil((x_high_mm - axis_origin_mm) / pixel_mm)) + 1,
+        )
+        y_start = max(0, int(math.floor((y_low_mm - axis_origin_mm) / pixel_mm)))
+        y_stop = min(
+            pixel_count,
+            int(math.ceil((y_high_mm - axis_origin_mm) / pixel_mm)) + 1,
+        )
+        if x_stop <= x_start or y_stop <= y_start:
+            continue
+
+        x_centers_mm = (
+            axis_origin_mm + (np.arange(x_start, x_stop) + 0.5) * pixel_mm
+        )
+        y_centers_mm = (
+            axis_origin_mm + (np.arange(y_start, y_stop) + 0.5) * pixel_mm
+        )
+        local = np.zeros((y_stop - y_start, x_stop - x_start), dtype=np.float64)
+        for offset_y in subsample_offsets:
+            for offset_x in subsample_offsets:
+                distance_squared = (
+                    (x_centers_mm[None, :] + offset_x * pixel_mm - center_x_mm) ** 2
+                    + (y_centers_mm[:, None] + offset_y * pixel_mm - center_y_mm) ** 2
+                )
+                local += (distance_squared <= radius_mm * radius_mm).astype(
+                    np.float64
+                )
+        coverage[y_start:y_stop, x_start:x_stop] += (
+            local * pixel_area_subweight
+        )
+
+    coverage = np.clip(coverage, 0.0, 1.0)
+    return MaskGeometry(
+        coverage=coverage,
+        pixel_mm=pixel_mm,
+        x_min_mm=-half_extent_mm,
+        x_max_mm=half_extent_mm,
+        y_min_mm=-half_extent_mm,
+        y_max_mm=half_extent_mm,
+    )
+
+
+def region_equivalent_diameter_px(region: Any) -> float:
+    """兼容 skimage 版本：0.26 起 equivalent_diameter 改名为
+    equivalent_diameter_area，两者都表示由面积反推的等效直径。"""
+    if hasattr(region, "equivalent_diameter_area"):
+        return float(region.equivalent_diameter_area)
+    return float(region.equivalent_diameter)
+
+
+def lattice_unit_cell_area_mm2(pattern_kind: str, pitch_mm: float) -> float:
+    """每种晶格分摊到单个孔的单元面积，用于解析填充率。"""
+    if pattern_kind == ARRAY_PATTERN_SQUARE_PACKING:
+        return pitch_mm * pitch_mm
+    if pattern_kind == ARRAY_PATTERN_TRIANGULAR_PACKING:
+        return math.sqrt(3.0) / 2.0 * pitch_mm * pitch_mm
+    if pattern_kind == ARRAY_PATTERN_HEXAGONAL_PACKING:
+        # 蜂窝基元含 2 个孔，晶胞面积 |a1 x a2| = 1.5*sqrt(3)*p^2。
+        return 0.75 * math.sqrt(3.0) * pitch_mm * pitch_mm
+    return math.nan
+
+
+def validate_mask(
+    mask: MaskGeometry,
+    layout: ArrayLayout,
+    config: ArrayGhostSimulationConfig,
+) -> dict[str, Any]:
+    """方案 3.2 与 V-A：面积、连通域、等效直径、圆度与质心。"""
+    from scipy import ndimage
+    from skimage.measure import regionprops
+
+    binary = mask.coverage >= config.mask_binary_threshold
+    labeled, label_count = ndimage.label(binary)
+    regions = regionprops(labeled)
+
+    pixel_area_mm2 = mask.pixel_mm * mask.pixel_mm
+    numeric_area_mm2 = float(mask.coverage.sum() * pixel_area_mm2)
+    analytic_area_mm2 = layout.hole_count * math.pi * (0.5 * layout.diameter_mm) ** 2
+    relative_area_error = (
+        abs(numeric_area_mm2 - analytic_area_mm2) / analytic_area_mm2
+        if analytic_area_mm2 > 0.0
+        else math.nan
+    )
+
+    equivalent_diameters_mm = [
+        region_equivalent_diameter_px(region) * mask.pixel_mm
+        for region in regions
+    ]
+    circularity_values = []
+    for region in regions:
+        perimeter = float(region.perimeter) * mask.pixel_mm
+        area = float(region.area) * pixel_area_mm2
+        if perimeter > 0.0:
+            circularity_values.append(4.0 * math.pi * area / (perimeter * perimeter))
+
+    # 质心偏差：每个设计孔心去最近的设计位置比对。
+    max_centroid_offset_mm = 0.0
+    if regions:
+        designed_centers = np.asarray(layout.centers_mm, dtype=np.float64)
+        for region in regions:
+            centroid_y_px, centroid_x_px = region.centroid
+            centroid_x_mm = mask.x_min_mm + (centroid_x_px + 0.5) * mask.pixel_mm
+            centroid_y_mm = mask.y_min_mm + (centroid_y_px + 0.5) * mask.pixel_mm
+            offsets = np.sqrt(
+                (designed_centers[:, 0] - centroid_x_mm) ** 2
+                + (designed_centers[:, 1] - centroid_y_mm) ** 2
+            )
+            max_centroid_offset_mm = max(
+                max_centroid_offset_mm, float(offsets.min())
+            )
+
+    unit_cell_area_mm2 = lattice_unit_cell_area_mm2(
+        layout.pattern_kind, layout.pitch_nominal_mm
+    )
+    lattice_filling_fraction = (
+        math.pi * (0.5 * layout.diameter_mm) ** 2 / unit_cell_area_mm2
+        if math.isfinite(unit_cell_area_mm2) and unit_cell_area_mm2 > 0.0
+        else math.nan
+    )
+
+    centroid_tolerance_mm = (
+        config.mask_centroid_tolerance_pixel * mask.pixel_mm
+    )
+    fail_reasons: list[str] = []
+    if not math.isfinite(relative_area_error):
+        fail_reasons.append("area_error_not_finite")
+    elif relative_area_error > config.mask_area_relative_tolerance:
+        fail_reasons.append("area_error_exceeds_tolerance")
+    if label_count != layout.hole_count:
+        fail_reasons.append("connected_component_count_mismatch")
+    if max_centroid_offset_mm > centroid_tolerance_mm:
+        fail_reasons.append("centroid_offset_exceeds_tolerance")
+    if circularity_values and min(circularity_values) < config.mask_minimum_circularity:
+        fail_reasons.append("circularity_below_tolerance")
+
+    return {
+        "pattern_kind": layout.pattern_kind,
+        "designed_hole_count": layout.hole_count,
+        "labeled_hole_count": int(label_count),
+        "numeric_hole_area_mm2": numeric_area_mm2,
+        "analytic_hole_area_mm2": analytic_area_mm2,
+        "relative_area_error": relative_area_error,
+        "window_area_fraction": numeric_area_mm2 / mask.window_area_mm2,
+        "lattice_filling_fraction": lattice_filling_fraction,
+        "mean_equivalent_diameter_mm": (
+            float(np.mean(equivalent_diameters_mm))
+            if equivalent_diameters_mm
+            else math.nan
+        ),
+        "min_circularity": (
+            float(min(circularity_values)) if circularity_values else math.nan
+        ),
+        "max_centroid_offset_mm": max_centroid_offset_mm,
+        "centroid_tolerance_mm": centroid_tolerance_mm,
+        "mask_pixel_mm": mask.pixel_mm,
+        "mask_pixel_count": mask.pixel_count,
+        "mask_ok": not fail_reasons,
+        "fail_reasons": "|".join(fail_reasons),
     }
 #
 # ============================================================================
