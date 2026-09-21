@@ -1188,6 +1188,7 @@ class ArrayGhostSimulationConfig:
     diameter_pitch_figure_size_inches: tuple[float, float] = (30.0, 22.0)
     slice_figure_size_inches: tuple[float, float] = (28.0, 18.0)
     design_figure_size_inches: tuple[float, float] = (28.0, 18.0)
+    view_coverage_figure_size_inches: tuple[float, float] = (30.0, 20.0)
     validation_figure_size_inches: tuple[float, float] = (36.0, 14.0)
     suptitle_font_size: float = 17.0
     axis_title_font_size: float = 12.0
@@ -1265,7 +1266,16 @@ class ArrayGhostSimulationConfig:
     diameter_pitch_figure_filename: str = "ghost_diameter_pitch_relation.png"
     slice_figure_filename: str = "pitch_diameter_slices.png"
     design_figure_filename: str = "design_comparison.png"
+    view_coverage_filename: str = "view_angle_coverage.csv"
+    view_coverage_figure_filename: str = "view_angle_coverage.png"
     validation_figure_filename: str = "validation_table.png"
+
+    # 视角覆盖图只做孔圆与瞳孔圆的二维几何诊断。它不是新的传播模型，
+    # 因此样本数只影响覆盖率积分和示意图的分辨率。
+    view_coverage_pitch_sample_count: int = 121
+    view_coverage_cell_sample_count: int = 257
+    view_coverage_example_pitch_mm: float = 4.0
+    view_coverage_multiplicity_vmax: float = 4.0
 
     # ------------------------------------------------------- 运行模式
     run_mode: str = "full"
@@ -1424,6 +1434,12 @@ def validate_config(config: ArrayGhostSimulationConfig) -> None:
             config.retinal_scene_pitch_diameter_mm
         ),
         "retinal_scene_pitch_pupil_mm": config.retinal_scene_pitch_pupil_mm,
+        "view_coverage_example_pitch_mm": (
+            config.view_coverage_example_pitch_mm
+        ),
+        "view_coverage_multiplicity_vmax": (
+            config.view_coverage_multiplicity_vmax
+        ),
         "heatmap_singleton_extent_fraction": (
             config.heatmap_singleton_extent_fraction
         ),
@@ -1534,6 +1550,12 @@ def validate_config(config: ArrayGhostSimulationConfig) -> None:
         "direction_histogram_bin_count": config.direction_histogram_bin_count,
         "valley_profile_sample_count": config.valley_profile_sample_count,
         "aperture_anti_alias_subsamples": config.aperture_anti_alias_subsamples,
+        "view_coverage_pitch_sample_count": (
+            config.view_coverage_pitch_sample_count
+        ),
+        "view_coverage_cell_sample_count": (
+            config.view_coverage_cell_sample_count
+        ),
     }
     for name, value in integer_fields.items():
         if int(value) < 1:
@@ -1542,6 +1564,18 @@ def validate_config(config: ArrayGhostSimulationConfig) -> None:
         raise ValueError("analysis_grid_size must be even")
     if config.field_grid_max_size % 2 != 0:
         raise ValueError("field_grid_max_size must be even")
+    if config.view_coverage_cell_sample_count < 2:
+        raise ValueError(
+            "view_coverage_cell_sample_count must be at least 2"
+        )
+    if not (
+        config.minimum_pitch_mm
+        <= config.view_coverage_example_pitch_mm
+        <= config.maximum_pitch_mm
+    ):
+        raise ValueError(
+            "view_coverage_example_pitch_mm must lie inside the pitch range"
+        )
     if config.direction_histogram_bin_count < 4:
         raise ValueError("direction_histogram_bin_count must be at least 4")
     if config.solar_radial_ring_dense_count < config.solar_radial_ring_count:
@@ -1668,6 +1702,8 @@ def validate_config(config: ArrayGhostSimulationConfig) -> None:
         "diameter_pitch_figure_filename",
         "slice_figure_filename",
         "design_figure_filename",
+        "view_coverage_filename",
+        "view_coverage_figure_filename",
         "validation_figure_filename",
     ):
         validate_output_component(getattr(config, field_name), field_name)
@@ -3227,6 +3263,238 @@ def compute_hole_weights(
         dtype=np.float64,
     )
     return weights, "quasi_static_pupil"
+
+
+def pupil_acceptance_radius_mm(
+    hole_diameter_mm: float,
+    pupil_diameter_mm: float,
+) -> float:
+    """孔圆与瞳孔圆仍有交叠的最大孔心横向偏移。
+
+    这是圆与圆的几何交叠半径，不是孔心必须落入瞳孔的半径：
+    b = (D + d) / 2。
+    """
+    if hole_diameter_mm <= 0.0:
+        raise ValueError("hole_diameter_mm must be positive")
+    if pupil_diameter_mm <= 0.0:
+        raise ValueError("pupil_diameter_mm must be positive")
+    return 0.5 * (pupil_diameter_mm + hole_diameter_mm)
+
+
+def axis_single_hole_pitch_limit_mm(
+    hole_diameter_mm: float,
+    pupil_diameter_mm: float,
+) -> float:
+    """轴上注视时，相邻孔首次不进入瞳孔的孔距。"""
+    return pupil_acceptance_radius_mm(
+        hole_diameter_mm,
+        pupil_diameter_mm,
+    )
+
+
+def all_gaze_single_hole_pitch_limit_mm(
+    hole_diameter_mm: float,
+    pupil_diameter_mm: float,
+) -> float:
+    """任意注视方向都不会同时容纳两个孔的最小孔距。
+
+    每个孔在视角空间中贡献半径为 b 的圆形接受区。相邻区域不交叠要求
+    p >= 2b。这个条件消除双覆盖，但不保证孔间没有视角盲区。
+    """
+    return 2.0 * pupil_acceptance_radius_mm(
+        hole_diameter_mm,
+        pupil_diameter_mm,
+    )
+
+
+def square_lattice_gap_free_pitch_limit_mm(
+    hole_diameter_mm: float,
+    pupil_diameter_mm: float,
+) -> float:
+    """正方形孔阵在视角空间没有无光空隙的最大孔距。
+
+    正方形晶格的覆盖半径是 p / sqrt(2)，因此 p <= sqrt(2) b 时
+    每个视角点至少落入一个孔接受区；代价是相邻区域已经明显重叠。
+    """
+    return math.sqrt(2.0) * pupil_acceptance_radius_mm(
+        hole_diameter_mm,
+        pupil_diameter_mm,
+    )
+
+
+def triangular_lattice_gap_free_pitch_limit_mm(
+    hole_diameter_mm: float,
+    pupil_diameter_mm: float,
+) -> float:
+    """三角形六近邻孔阵没有无光空隙的最大孔距。"""
+    return math.sqrt(3.0) * pupil_acceptance_radius_mm(
+        hole_diameter_mm,
+        pupil_diameter_mm,
+    )
+
+
+def _square_lattice_multiplicity(
+    x_mm: np.ndarray,
+    y_mm: np.ndarray,
+    pitch_mm: float,
+    acceptance_radius_mm: float,
+) -> np.ndarray:
+    """返回正方形孔阵在各采样点同时覆盖该视角的孔数。"""
+    if pitch_mm <= 0.0:
+        raise ValueError("pitch_mm must be positive")
+    if acceptance_radius_mm <= 0.0:
+        raise ValueError("acceptance_radius_mm must be positive")
+    maximum_coordinate_mm = max(
+        float(np.max(np.abs(x_mm))),
+        float(np.max(np.abs(y_mm))),
+    )
+    center_index_limit = int(
+        math.ceil(
+            (maximum_coordinate_mm + acceptance_radius_mm) / pitch_mm
+        )
+    )
+    multiplicity = np.zeros(x_mm.shape, dtype=np.int16)
+    radius_squared_mm2 = acceptance_radius_mm * acceptance_radius_mm
+    for x_index in range(-center_index_limit, center_index_limit + 1):
+        center_x_mm = x_index * pitch_mm
+        for y_index in range(-center_index_limit, center_index_limit + 1):
+            center_y_mm = y_index * pitch_mm
+            multiplicity += (
+                (x_mm - center_x_mm) ** 2
+                + (y_mm - center_y_mm) ** 2
+                <= radius_squared_mm2
+            )
+    return multiplicity
+
+
+def square_lattice_coverage_fractions(
+    pitch_mm: float,
+    acceptance_radius_mm: float,
+    sample_count: int,
+) -> dict[str, float]:
+    """数值积分正方形晶格一个原胞内的零孔、单孔和多孔覆盖率。"""
+    if sample_count < 2:
+        raise ValueError("sample_count must be at least 2")
+    coordinate_mm = (
+        (np.arange(sample_count, dtype=np.float64) + 0.5)
+        / float(sample_count)
+        - 0.5
+    ) * pitch_mm
+    grid_x_mm, grid_y_mm = np.meshgrid(
+        coordinate_mm,
+        coordinate_mm,
+        indexing="xy",
+    )
+    multiplicity = _square_lattice_multiplicity(
+        grid_x_mm,
+        grid_y_mm,
+        pitch_mm,
+        acceptance_radius_mm,
+    )
+    sample_total = float(multiplicity.size)
+    return {
+        "zero_coverage_fraction": float(
+            np.count_nonzero(multiplicity == 0) / sample_total
+        ),
+        "single_hole_coverage_fraction": float(
+            np.count_nonzero(multiplicity == 1) / sample_total
+        ),
+        "multi_hole_coverage_fraction": float(
+            np.count_nonzero(multiplicity >= 2) / sample_total
+        ),
+    }
+
+
+VIEW_COVERAGE_FIELDS: tuple[str, ...] = (
+    "pitch_mm",
+    "acceptance_radius_mm",
+    "axis_visible_hole_count",
+    "axis_single_hole_limit_mm",
+    "all_gaze_single_hole_limit_mm",
+    "square_gap_free_limit_mm",
+    "triangular_gap_free_limit_mm",
+    "zero_coverage_fraction",
+    "single_hole_coverage_fraction",
+    "multi_hole_coverage_fraction",
+    "coverage_class",
+)
+
+
+def build_view_coverage_rows(
+    config: ArrayGhostSimulationConfig,
+) -> list[dict[str, Any]]:
+    """生成孔距扫描的视角覆盖诊断数据。"""
+    hole_diameter_mm = config.retinal_scene_pitch_diameter_mm
+    pupil_diameter_mm = config.retinal_scene_pitch_pupil_mm
+    acceptance_radius_mm = pupil_acceptance_radius_mm(
+        hole_diameter_mm,
+        pupil_diameter_mm,
+    )
+    axis_limit_mm = axis_single_hole_pitch_limit_mm(
+        hole_diameter_mm,
+        pupil_diameter_mm,
+    )
+    single_hole_limit_mm = all_gaze_single_hole_pitch_limit_mm(
+        hole_diameter_mm,
+        pupil_diameter_mm,
+    )
+    square_gap_free_limit_mm = square_lattice_gap_free_pitch_limit_mm(
+        hole_diameter_mm,
+        pupil_diameter_mm,
+    )
+    triangular_gap_free_limit_mm = (
+        triangular_lattice_gap_free_pitch_limit_mm(
+            hole_diameter_mm,
+            pupil_diameter_mm,
+        )
+    )
+    pitch_values_mm = np.linspace(
+        config.minimum_pitch_mm,
+        config.maximum_pitch_mm,
+        config.view_coverage_pitch_sample_count,
+        dtype=np.float64,
+    )
+    rows: list[dict[str, Any]] = []
+    for pitch_mm in pitch_values_mm:
+        fractions = square_lattice_coverage_fractions(
+            float(pitch_mm),
+            acceptance_radius_mm,
+            config.view_coverage_cell_sample_count,
+        )
+        axis_visible_hole_count = 0
+        center_index_limit = int(
+            math.ceil(axis_limit_mm / pitch_mm)
+        )
+        for x_index in range(-center_index_limit, center_index_limit + 1):
+            for y_index in range(-center_index_limit, center_index_limit + 1):
+                offset_mm = pitch_mm * math.hypot(x_index, y_index)
+                if offset_mm < axis_limit_mm:
+                    axis_visible_hole_count += 1
+        if fractions["multi_hole_coverage_fraction"] > 0.0:
+            if fractions["zero_coverage_fraction"] > 0.0:
+                coverage_class = "simultaneous_overlap_and_gap"
+            else:
+                coverage_class = "gap_free_but_multi_hole"
+        elif fractions["zero_coverage_fraction"] > 0.0:
+            coverage_class = "single_hole_overlap_free_but_gap"
+        else:
+            coverage_class = "exactly_one_hole"
+        rows.append(
+            {
+                "pitch_mm": float(pitch_mm),
+                "acceptance_radius_mm": acceptance_radius_mm,
+                "axis_visible_hole_count": axis_visible_hole_count,
+                "axis_single_hole_limit_mm": axis_limit_mm,
+                "all_gaze_single_hole_limit_mm": single_hole_limit_mm,
+                "square_gap_free_limit_mm": square_gap_free_limit_mm,
+                "triangular_gap_free_limit_mm": (
+                    triangular_gap_free_limit_mm
+                ),
+                **fractions,
+                "coverage_class": coverage_class,
+            }
+        )
+    return rows
 
 
 def defocus_hole_shifts_arcmin(
@@ -5588,6 +5856,11 @@ def write_all_outputs(
         solar_convergence_rows,
         SOLAR_CONVERGENCE_FIELDS,
     )
+    write_csv(
+        directory / config.view_coverage_filename,
+        build_view_coverage_rows(config),
+        VIEW_COVERAGE_FIELDS,
+    )
     with (directory / config.config_filename).open(
         "w", encoding="utf-8"
     ) as file:
@@ -7215,6 +7488,194 @@ def save_design_comparison_figure(
     )
 
 
+def save_view_coverage_figure(
+    config: ArrayGhostSimulationConfig,
+    directory: Path,
+) -> None:
+    """显示不同孔距下的单孔、双覆盖与视角盲区分界。"""
+    hole_diameter_mm = config.retinal_scene_pitch_diameter_mm
+    pupil_diameter_mm = config.retinal_scene_pitch_pupil_mm
+    acceptance_radius_mm = pupil_acceptance_radius_mm(
+        hole_diameter_mm,
+        pupil_diameter_mm,
+    )
+    axis_limit_mm = axis_single_hole_pitch_limit_mm(
+        hole_diameter_mm,
+        pupil_diameter_mm,
+    )
+    single_hole_limit_mm = all_gaze_single_hole_pitch_limit_mm(
+        hole_diameter_mm,
+        pupil_diameter_mm,
+    )
+    gap_free_limit_mm = square_lattice_gap_free_pitch_limit_mm(
+        hole_diameter_mm,
+        pupil_diameter_mm,
+    )
+    coverage_rows = build_view_coverage_rows(config)
+    pitches_mm = np.asarray(
+        [float(row["pitch_mm"]) for row in coverage_rows],
+        dtype=np.float64,
+    )
+    zero_fraction = np.asarray(
+        [float(row["zero_coverage_fraction"]) for row in coverage_rows],
+        dtype=np.float64,
+    )
+    single_fraction = np.asarray(
+        [float(row["single_hole_coverage_fraction"]) for row in coverage_rows],
+        dtype=np.float64,
+    )
+    multi_fraction = np.asarray(
+        [float(row["multi_hole_coverage_fraction"]) for row in coverage_rows],
+        dtype=np.float64,
+    )
+
+    figure, axes = plt.subplots(
+        2,
+        2,
+        figsize=config.view_coverage_figure_size_inches,
+        dpi=config.figure_dpi,
+    )
+    example_pitches_mm = (
+        axis_limit_mm,
+        config.view_coverage_example_pitch_mm,
+        single_hole_limit_mm,
+    )
+    example_titles = (
+        "轴上单孔：越出轴向后仍会双覆盖并留有空隙",
+        f"p={config.view_coverage_example_pitch_mm:.2f} mm："
+        "无视角空隙，但已有双覆盖",
+        "全视场最多单孔：不再双覆盖，但存在视角空隙",
+    )
+    sample_count = config.view_coverage_cell_sample_count
+    for axis, pitch_mm, title in zip(
+        axes.ravel()[:3],
+        example_pitches_mm,
+        example_titles,
+    ):
+        coordinate_mm = np.linspace(
+            -pitch_mm,
+            pitch_mm,
+            sample_count,
+            dtype=np.float64,
+        )
+        grid_x_mm, grid_y_mm = np.meshgrid(
+            coordinate_mm,
+            coordinate_mm,
+            indexing="xy",
+        )
+        multiplicity = _square_lattice_multiplicity(
+            grid_x_mm,
+            grid_y_mm,
+            pitch_mm,
+            acceptance_radius_mm,
+        )
+        image = axis.imshow(
+            multiplicity,
+            origin="lower",
+            extent=(
+                -pitch_mm,
+                pitch_mm,
+                -pitch_mm,
+                pitch_mm,
+            ),
+            cmap=config.heatmap_colormap_name,
+            vmin=0.0,
+            vmax=config.view_coverage_multiplicity_vmax,
+            interpolation="nearest",
+        )
+        colorbar = figure.colorbar(image, ax=axis, fraction=0.046, pad=0.04)
+        colorbar.set_label(
+            "同时覆盖的孔数 / holes",
+            fontsize=config.axis_label_font_size,
+        )
+        colorbar.ax.tick_params(labelsize=config.tick_font_size)
+        axis.set_title(
+            f"p={pitch_mm:.2f} mm\n{title}",
+            fontsize=config.panel_title_font_size,
+        )
+        axis.set_xlabel(
+            "视角位移 z tan(theta) / mm",
+            fontsize=config.axis_label_font_size,
+        )
+        axis.set_ylabel(
+            "视角位移 z tan(theta) / mm",
+            fontsize=config.axis_label_font_size,
+        )
+        axis.tick_params(labelsize=config.tick_font_size)
+        axis.set_aspect("equal")
+
+    coverage_axis = axes.ravel()[3]
+    coverage_axis.plot(
+        pitches_mm,
+        single_fraction,
+        label="恰好 1 个孔 / exactly one",
+        linewidth=2.5,
+    )
+    coverage_axis.plot(
+        pitches_mm,
+        multi_fraction,
+        label="至少 2 个孔 / possible ghost",
+        linewidth=2.5,
+    )
+    coverage_axis.plot(
+        pitches_mm,
+        zero_fraction,
+        label="0 个孔 / blind gap",
+        linewidth=2.5,
+    )
+    for value, label, colour in (
+        (axis_limit_mm, f"轴上单孔 {axis_limit_mm:.2f}", "tab:green"),
+        (
+            gap_free_limit_mm,
+            f"正方形无盲区 {gap_free_limit_mm:.2f}",
+            "tab:orange",
+        ),
+        (
+            single_hole_limit_mm,
+            f"无重叠 {single_hole_limit_mm:.2f}",
+            "tab:red",
+        ),
+    ):
+        coverage_axis.axvline(
+            value,
+            color=colour,
+            linestyle="--",
+            linewidth=1.5,
+            label=label,
+        )
+    coverage_axis.set_xlim(
+        float(pitches_mm.min()),
+        float(pitches_mm.max()),
+    )
+    coverage_axis.set_ylim(-0.02, 1.02)
+    coverage_axis.set_xlabel(
+        "孔距 p / mm",
+        fontsize=config.axis_label_font_size,
+    )
+    coverage_axis.set_ylabel(
+        "视角面积占比 / fraction of gaze directions",
+        fontsize=config.axis_label_font_size,
+    )
+    coverage_axis.set_title(
+        "正方形孔阵的视角覆盖权衡 / coverage trade-off",
+        fontsize=config.panel_title_font_size,
+    )
+    coverage_axis.tick_params(labelsize=config.tick_font_size)
+    coverage_axis.legend(
+        fontsize=config.legend_font_size,
+        loc="center right",
+    )
+    coverage_axis.grid(alpha=0.25)
+
+    _save_figure(
+        figure,
+        directory / config.view_coverage_figure_filename,
+        config,
+        "单孔退化极限、双覆盖与视角盲区 / "
+        "single-hole limit, ghosting and blind gaps",
+    )
+
+
 def save_validation_table_figure(
     config: ArrayGhostSimulationConfig,
     validation_rows: Sequence[dict[str, Any]],
@@ -7350,6 +7811,7 @@ def save_all_figures(
     save_diameter_pitch_relation_figure(config, metric_rows, directory)
     save_pitch_diameter_slices_figure(config, metric_rows, directory)
     save_design_comparison_figure(config, metric_rows, directory)
+    save_view_coverage_figure(config, directory)
     save_validation_table_figure(config, validation_rows, directory)
 
 

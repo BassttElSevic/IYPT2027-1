@@ -16,6 +16,8 @@ import numpy as np
 
 from pinhole_array_ghost import (
     accumulate_shifted_kernels,
+    all_gaze_single_hole_pitch_limit_mm,
+    axis_single_hole_pitch_limit_mm,
     build_diameter_anchor_grid,
     build_geometry_rows,
     build_psf_cache,
@@ -23,6 +25,7 @@ from pinhole_array_ghost import (
     build_solar_convergence_rows,
     build_solar_directions,
     build_solar_disk_kernel,
+    build_view_coverage_rows,
     circle_overlap_area_mm2,
     compute_hole_weights,
     cluster_ghost_positions,
@@ -43,7 +46,11 @@ from pinhole_array_ghost import (
     measure_image_width_arcmin,
     minimum_nonzero_shift_distance_arcmin,
     plan_field_grid,
+    pupil_acceptance_radius_mm,
     resample_psf_to_grid,
+    square_lattice_coverage_fractions,
+    square_lattice_gap_free_pitch_limit_mm,
+    triangular_lattice_gap_free_pitch_limit_mm,
 )
 from pinhole_array_ghost import (
     ARRAY_PATTERN_SQUARE_PACKING,
@@ -540,6 +547,94 @@ class HoleWeightTest(unittest.TestCase):
         self.assertTrue((weights >= 0.0).all())
         self.assertTrue((weights <= 1.0 + 1e-12).all())
         self.assertTrue((weights < 1.0).any())
+
+
+class ViewCoverageLimitTest(unittest.TestCase):
+    def test_clinical_geometry_limits_match_closed_form(self) -> None:
+        acceptance_radius_mm = pupil_acceptance_radius_mm(0.9, 5.3)
+
+        self.assertAlmostEqual(acceptance_radius_mm, 3.1, places=12)
+        self.assertAlmostEqual(
+            axis_single_hole_pitch_limit_mm(0.9, 5.3),
+            3.1,
+            places=12,
+        )
+        self.assertAlmostEqual(
+            all_gaze_single_hole_pitch_limit_mm(0.9, 5.3),
+            6.2,
+            places=12,
+        )
+        self.assertAlmostEqual(
+            square_lattice_gap_free_pitch_limit_mm(0.9, 5.3),
+            math.sqrt(2.0) * 3.1,
+            places=12,
+        )
+        self.assertAlmostEqual(
+            triangular_lattice_gap_free_pitch_limit_mm(0.9, 5.3),
+            math.sqrt(3.0) * 3.1,
+            places=12,
+        )
+
+    def test_square_lattice_cannot_be_gap_free_and_overlap_free(self) -> None:
+        acceptance_radius_mm = 3.1
+        gap_free_sample = square_lattice_coverage_fractions(
+            4.0,
+            acceptance_radius_mm,
+            sample_count=401,
+        )
+        overlap_free_sample = square_lattice_coverage_fractions(
+            8.0,
+            acceptance_radius_mm,
+            sample_count=401,
+        )
+
+        self.assertEqual(gap_free_sample["zero_coverage_fraction"], 0.0)
+        self.assertGreater(
+            gap_free_sample["multi_hole_coverage_fraction"],
+            0.0,
+        )
+        self.assertEqual(
+            overlap_free_sample["multi_hole_coverage_fraction"],
+            0.0,
+        )
+        self.assertGreater(
+            overlap_free_sample["zero_coverage_fraction"],
+            0.0,
+        )
+
+    def test_coverage_rows_keep_axis_limit_separate_from_gap_limit(self) -> None:
+        config = replace(
+            ArrayGhostSimulationConfig(),
+            view_coverage_pitch_sample_count=5,
+            view_coverage_cell_sample_count=101,
+        )
+        rows = build_view_coverage_rows(config)
+
+        self.assertEqual(len(rows), 5)
+        for row in rows:
+            self.assertAlmostEqual(
+                row["axis_single_hole_limit_mm"],
+                3.1,
+                places=12,
+            )
+            self.assertAlmostEqual(
+                row["all_gaze_single_hole_limit_mm"],
+                6.2,
+                places=12,
+            )
+            self.assertAlmostEqual(
+                row["square_gap_free_limit_mm"],
+                math.sqrt(2.0) * 3.1,
+                places=12,
+            )
+        self.assertEqual(
+            rows[0]["coverage_class"],
+            "gap_free_but_multi_hole",
+        )
+        self.assertEqual(
+            rows[-1]["coverage_class"],
+            "single_hole_overlap_free_but_gap",
+        )
 
 
 class PsfCacheTest(unittest.TestCase):
